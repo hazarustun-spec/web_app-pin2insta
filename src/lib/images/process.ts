@@ -12,8 +12,9 @@ export function sha256(buf: Buffer): string {
 
 /** Center-crop to 4:5 and cap at 1080x1350. Content at the edges is lost by design. */
 export async function cropTo45(buf: Buffer): Promise<Buffer> {
-  const image = sharp(buf).rotate() // honour EXIF orientation before measuring
-  const metadata = await image.metadata()
+  // Materialize rotation before measuring—metadata() returns raw dimensions without pending transforms.
+  const rotated = await sharp(buf).rotate().toBuffer()
+  const metadata = await sharp(rotated).metadata()
 
   if (!metadata.width || !metadata.height) {
     throw new Error('Görsel yüklenemedi')
@@ -24,17 +25,22 @@ export async function cropTo45(buf: Buffer): Promise<Buffer> {
     throw new Error('görsel çok küçük — en az 320px olmalı')
   }
 
-  // Calculate the maximum dimensions for a 4:5 crop without enlargement.
-  // The 4:5 ratio means width / height = 0.8.
-  const maxWidth = Math.min(TARGET_W, metadata.width)
-  const maxHeight = Math.min(TARGET_H, metadata.height)
+  // Calculate exact 4:5 dimensions by choosing height first as a multiple of 5.
+  // This guarantees width / height === 0.8 exactly for every input.
+  const maxH = Math.min(TARGET_H, metadata.height)
+  const maxW = Math.min(TARGET_W, metadata.width)
 
-  // Adjust to maintain 4:5 ratio without enlargement
-  const targetWidth = Math.min(maxWidth, maxHeight * 0.8)
-  const targetHeight = targetWidth / 0.8
+  // Find the largest h that is a multiple of 5, <= maxH, and whose derived w is <= maxW.
+  let targetH = Math.floor(maxH / 5) * 5
+  let targetW = (targetH / 5) * 4
 
-  return image
-    .resize(Math.round(targetWidth), Math.round(targetHeight), { fit: 'cover', position: 'centre' })
+  while (targetW > maxW && targetH > 0) {
+    targetH -= 5
+    targetW = (targetH / 5) * 4
+  }
+
+  return sharp(rotated)
+    .resize(targetW, targetH, { fit: 'cover', position: 'centre' })
     .jpeg({ quality: 88, mozjpeg: true })
     .toBuffer()
 }

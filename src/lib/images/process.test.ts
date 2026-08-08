@@ -52,6 +52,52 @@ describe('cropTo45', () => {
     expect(width).toBe(1080)
     expect(height).toBe(1350)
   })
+
+  it('maintains exact 4:5 ratio for odd sizes (999x1001)', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(999, 1001))).metadata()
+    expect(width! / height!).toBe(0.8)
+  })
+
+  it('maintains exact 4:5 ratio for odd sizes (641x801)', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(641, 801))).metadata()
+    expect(width! / height!).toBe(0.8)
+  })
+
+  it('maintains exact 4:5 ratio for odd sizes (323x404)', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(323, 404))).metadata()
+    expect(width! / height!).toBe(0.8)
+  })
+
+  it('never enlarges EXIF orientation-6 source beyond post-rotation dimensions', async () => {
+    // Create a 400x1300 JPEG and rotate 90° CW (simulating EXIF orientation 6).
+    // Post-rotation true size is 1300x400.
+    const buf = await sharp({
+      create: { width: 400, height: 1300, channels: 3, background: { r: 200, g: 200, b: 200 } },
+    })
+      .rotate(90)
+      .jpeg()
+      .toBuffer()
+
+    const result = await cropTo45(buf)
+    const { width, height } = await sharp(result).metadata()
+
+    // Post-rotation true size is 1300x400. Output should never exceed these.
+    expect(width).toBeLessThanOrEqual(1300)
+    expect(height).toBeLessThanOrEqual(400)
+  })
+
+  it('rejects sources with 319px short edge', async () => {
+    await expect(cropTo45(await solid(319, 5000))).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+    await expect(cropTo45(await solid(5000, 319))).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+  })
+
+  it('accepts sources with exactly 320px short edge', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(320, 5000))).metadata()
+    expect(width! / height!).toBe(0.8)
+
+    const { width: w2, height: h2 } = await sharp(await cropTo45(await solid(5000, 320))).metadata()
+    expect(w2! / h2!).toBe(0.8)
+  })
 })
 
 describe('makeThumb', () => {
