@@ -68,22 +68,73 @@ describe('cropTo45', () => {
     expect(width! / height!).toBe(0.8)
   })
 
-  it('never enlarges EXIF orientation-6 source beyond post-rotation dimensions', async () => {
-    // Create a 400x1300 JPEG and rotate 90° CW (simulating EXIF orientation 6).
-    // Post-rotation true size is 1300x400.
+  it('respects EXIF orientation 6: stored 400x1300 displays as 1300x400', async () => {
+    // Stored pixels: 400x1300 (portrait). EXIF orientation 6: rotate 90° CW for display.
+    // True displayed size: 1300x400 (landscape).
+    // Buggy code would read .metadata() = 400x1300 and calculate wrong dimensions.
     const buf = await sharp({
       create: { width: 400, height: 1300, channels: 3, background: { r: 200, g: 200, b: 200 } },
     })
-      .rotate(90)
+      .withMetadata({ orientation: 6 })
       .jpeg()
       .toBuffer()
 
     const result = await cropTo45(buf)
     const { width, height } = await sharp(result).metadata()
 
-    // Post-rotation true size is 1300x400. Output should never exceed these.
+    // Output must never exceed true post-rotation dimensions (1300x400)
     expect(width).toBeLessThanOrEqual(1300)
     expect(height).toBeLessThanOrEqual(400)
+    // And must maintain exact 4:5 ratio
+    expect(width! / height!).toBe(0.8)
+  })
+
+  it('respects EXIF orientation 5: stored 1300x400 displays as 400x1300', async () => {
+    // Stored pixels: 1300x400 (landscape). EXIF orientation 5: rotate 90° CCW + flip.
+    // True displayed size: 400x1300 (portrait).
+    const buf = await sharp({
+      create: { width: 1300, height: 400, channels: 3, background: { r: 200, g: 200, b: 200 } },
+    })
+      .withMetadata({ orientation: 5 })
+      .jpeg()
+      .toBuffer()
+
+    const result = await cropTo45(buf)
+    const { width, height } = await sharp(result).metadata()
+
+    // Output must never exceed true post-rotation dimensions (400x1300)
+    expect(width).toBeLessThanOrEqual(400)
+    expect(height).toBeLessThanOrEqual(1300)
+    expect(width! / height!).toBe(0.8)
+  })
+
+  it('320px floor is checked on post-rotation dimensions with EXIF orientation 6', async () => {
+    // Stored pixels: 1000x319. EXIF orientation 6 (90° CW).
+    // Post-rotation: 319x1000. Short edge is 319 (below 320px threshold).
+    // Must throw, because the floor check should read post-rotation dimensions.
+    const buf = await sharp({
+      create: { width: 1000, height: 319, channels: 3, background: { r: 200, g: 200, b: 200 } },
+    })
+      .withMetadata({ orientation: 6 })
+      .jpeg()
+      .toBuffer()
+
+    await expect(cropTo45(buf)).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+  })
+
+  it('accepts 320px boundary on post-rotation short edge with EXIF orientation 6', async () => {
+    // Stored pixels: 1000x320. EXIF orientation 6 (90° CW).
+    // Post-rotation: 320x1000. Short edge is exactly 320px (at boundary).
+    const buf = await sharp({
+      create: { width: 1000, height: 320, channels: 3, background: { r: 200, g: 200, b: 200 } },
+    })
+      .withMetadata({ orientation: 6 })
+      .jpeg()
+      .toBuffer()
+
+    const result = await cropTo45(buf)
+    const { width, height } = await sharp(result).metadata()
+    expect(width! / height!).toBe(0.8)
   })
 
   it('rejects sources with 319px short edge', async () => {
