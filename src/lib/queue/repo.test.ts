@@ -10,8 +10,11 @@ describe('decideIngest', () => {
     expect(decideIngest('aaa', new Set(['aaa']))).toEqual({ status: 'duplicate' })
   })
 
-  it('rejects a duplicate even when the original was already published', () => {
-    // published rows keep their hash exactly so this stays true
-    expect(decideIngest('published-hash', new Set(['published-hash']))).toEqual({ status: 'duplicate' })
+  it('adds when the known-hash set is empty', () => {
+    expect(decideIngest('aaa', new Set())).toEqual({ status: 'added' })
+  })
+
+  it('adds when the hash differs from a known hash by a single character', () => {
+    expect(decideIngest('aaaa', new Set(['aaab']))).toEqual({ status: 'added' })
   })
 })
