@@ -31,6 +31,27 @@ describe('cropTo45', () => {
     const { height } = await sharp(await cropTo45(await solid(4000, 6000))).metadata()
     expect(height).toBeLessThanOrEqual(1350)
   })
+
+  it('does not enlarge a small in-ratio source', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(400, 500))).metadata()
+    expect(width).toBeLessThanOrEqual(400)
+    expect(height).toBeLessThanOrEqual(500)
+  })
+
+  it('crops a small out-of-ratio source to 4:5', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(640, 400))).metadata()
+    expect(width! / height!).toBeCloseTo(0.8, 2)
+  })
+
+  it('throws when shorter edge is under 320px', async () => {
+    await expect(cropTo45(await solid(300, 400))).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+  })
+
+  it('produces exactly 1080x1350 for large sources', async () => {
+    const { width, height } = await sharp(await cropTo45(await solid(5000, 6250))).metadata()
+    expect(width).toBe(1080)
+    expect(height).toBe(1350)
+  })
 })
 
 describe('makeThumb', () => {

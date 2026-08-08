@@ -5,6 +5,7 @@ export async function uploadImage(buf: Buffer, key: string) {
     access: 'public',
     contentType: 'image/jpeg',
     addRandomSuffix: false,
+    allowOverwrite: true, // Safe because keys are content-addressed — identical bytes always for identical key.
   })
   return { url: blob.url, pathname: blob.pathname }
 }
