@@ -17,13 +17,24 @@ export interface InstagramClient {
 }
 
 export class InstagramError extends Error {
-  constructor(message: string, readonly status?: number) {
+  constructor(
+    message: string,
+    readonly status?: number,
+    /** Graph API `error.type`, e.g. `OAuthException` — used to tell a dead token from a genuine data-not-found response. */
+    readonly type?: string,
+    /** Graph API `error.code`. */
+    readonly code?: number,
+  ) {
     super(message)
     this.name = 'InstagramError'
   }
 }
 
-/** Rejects payloads Instagram would reject, so dry-run and live behave identically. */
+/**
+ * Rejects payloads Instagram would reject, so dry-run and live behave identically.
+ * A caption on a `story` input passes validation but is intentionally discarded at publish
+ * time — the Graph API has no caption field for `media_type=STORIES`.
+ */
 export function validate(input: PublishInput): void {
   if (!input.caption.trim() && input.kind !== 'story') {
     throw new InstagramError('caption is empty')
