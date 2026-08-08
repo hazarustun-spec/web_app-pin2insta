@@ -44,7 +44,8 @@ export function upcomingSlots(
   let cursor = now
   for (let day = 0; day < 400 && out.length < count; day++) {
     const dateISO = localDate(cursor, timeZone)
-    for (const s of refsForDate(dateISO, slots, timeZone)) {
+    const daySlots = refsForDate(dateISO, slots, timeZone).sort((a, b) => a.at.getTime() - b.at.getTime())
+    for (const s of daySlots) {
       if (out.length >= count) break
       if (s.at <= now) continue
       if (taken.has(`${s.date}#${s.index}`)) continue
