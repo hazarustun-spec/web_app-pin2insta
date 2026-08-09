@@ -43,6 +43,10 @@ function Metrics({ post }: { post: PublishedPost }) {
     )
   }
   if (state === 'pending') return <Meta>ölçüm bekleniyor</Meta>
+  // Not a fault, and not a wait: Instagram publishes no interaction metrics for
+  // a story at all, so this row is finished and its absence of numbers says
+  // nothing about how it did.
+  if (state === 'story') return <Meta>hikâyeler için Instagram etkileşim ölçümü vermiyor</Meta>
   // media_publish answered 200 without an id, so nothing can ever be fetched
   // for this row. Saying "bekleniyor" here would be a wait with no end.
   return <Meta>Instagram kimliği kaydedilmedi — bu gönderinin ölçümü alınamıyor</Meta>

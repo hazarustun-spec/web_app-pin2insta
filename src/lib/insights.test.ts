@@ -172,7 +172,6 @@ beforeEach(() => {
 /** 10:00, 14:00 and 20:00 as `items.slot_index` stores them since Task 10. */
 const TEN = 600
 const TWO = 840
-const TWENTY = 1200
 const EIGHT = 1200
 
 const row = (slotIndex: number, likes: number, extra: Partial<MetricRow> = {}): MetricRow => ({
@@ -571,26 +570,32 @@ describe('listPublished', () => {
   it('keeps stories out of the slot comparison', async () => {
     const metric = { likes: 50, comments: 0, saved: 0, reach: 500 }
     const zero = { likes: 0, comments: 0, saved: 0, reach: 0 }
+    // Above MIN_SAMPLES on purpose: below it slotAdvice answers 'collecting'
+    // whichever way the filter goes, and the advice assertion proves nothing.
     state.items = [
-      // Every feed post scores exactly 50, in both slots.
-      ...Array.from({ length: 5 }, (_, i) => ({
-        ...publishedRow({ id: `t${i}`, slotIndex: TEN }), metric,
+      // Every feed post scores exactly 50, in both slots. One is a carousel,
+      // which is fully measurable and must still be counted — the exclusion
+      // names stories, not "everything that is not a feed post".
+      ...Array.from({ length: 8 }, (_, i) => ({
+        ...publishedRow({ id: `t${i}`, kind: i === 0 ? 'carousel' : 'feed', slotIndex: TEN }),
+        metric,
       })),
-      ...Array.from({ length: 5 }, (_, i) => ({
-        ...publishedRow({ id: `e${i}`, slotIndex: TWENTY }), metric,
+      ...Array.from({ length: 7 }, (_, i) => ({
+        ...publishedRow({ id: `e${i}`, slotIndex: EIGHT }), metric,
       })),
       // Three stories that happened to land on 20:00.
       ...Array.from({ length: 3 }, (_, i) => ({
-        ...publishedRow({ id: `s${i}`, kind: 'story', slotIndex: TWENTY }), metric: zero,
+        ...publishedRow({ id: `s${i}`, kind: 'story', slotIndex: EIGHT }), metric: zero,
       })),
     ]
 
     const { stats, advice } = await listPublished()
 
     expect(stats.map((s) => s.avgEngagement)).toEqual([50, 50])
-    expect(stats.map((s) => s.samples)).toEqual([5, 5])
+    // 8 and 7 — the carousel counts, the three stories do not.
+    expect(stats.map((s) => s.samples)).toEqual([8, 7])
     // Identical performance must not produce a recommendation to change a time.
-    expect(advice.state).not.toBe('weak-slot')
+    expect(advice.state).toBe('even')
   })
 
   it('turns the stored slot index into a time', async () => {
@@ -657,11 +662,29 @@ describe('metricState', () => {
   // Instagram reports no likes, comments or saves for a story, so a metrics row
   // holding zeros for one is not a measurement of anything. Printing
   // "0 beğeni · 0 kaydetme" states a number that was never taken.
-  it('is unmeasurable for a story even with a metrics row', () => {
+  it('is story for a story even with a metrics row', () => {
     expect(metricState({
       kind: 'story',
       metric: { likes: 0, comments: 0, reach: 0, saved: 0 },
       igMediaId: 'ig-a',
-    })).toBe('unmeasurable')
+    })).toBe('story')
+  })
+
+  // Distinct states, not one message for both: 'unmeasurable' says the id was
+  // never stored, which is a fault worth investigating. Saying that about a
+  // story — beside a working Instagram link — invents a problem.
+  it('does not report a story as a post whose instagram id went missing', () => {
+    expect(metricState({ kind: 'story', metric: null, igMediaId: 'ig-a' })).toBe('story')
+    expect(metricState({ kind: 'feed', metric: null, igMediaId: null })).toBe('unmeasurable')
+  })
+
+  // The exclusions name stories specifically. A carousel is fully measurable
+  // and must not be swept up by a predicate that means "not a feed post".
+  it('measures a carousel like any other post', () => {
+    expect(metricState({
+      kind: 'carousel',
+      metric: { likes: 9, comments: 1, reach: 90, saved: 2 },
+      igMediaId: 'ig-a',
+    })).toBe('measured')
   })
 })

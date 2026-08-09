@@ -449,20 +449,23 @@ export async function listPublished(limit = HISTORY_LIMIT): Promise<PublishedHis
 /**
  * Why a post shows no numbers.
  *
- * `pending` and `unmeasurable` look identical in the database — both are a
- * missing `metrics` row — but they are opposite facts. A post with no
- * `igMediaId` is the rare case where `media_publish` answered 200 without an
- * id: nothing can ever be fetched for it, and showing "ölçüm bekleniyor"
- * beside it would be a wait with no end. The owner is told the row is
- * finished instead.
+ * Three distinct facts that all look like "no numbers" on screen, and each
+ * needs its own sentence:
+ *
+ * - `pending`: the next refresh will fetch them.
+ * - `story`: Instagram publishes no likes, comments or saves for a story, so
+ *   there is nothing to fetch, ever — for any story, however well it did.
+ * - `unmeasurable`: `media_publish` answered 200 without an id, so nothing can
+ *   be fetched for THIS row. Rare, and a genuine sign something went wrong.
+ *
+ * Collapsing the middle case into the last one tells the owner their story's
+ * Instagram id was not saved, beside a working link built from it — a
+ * fabricated diagnosis in place of a fabricated number.
  */
 export function metricState(
   post: Pick<PublishedPost, 'metric' | 'igMediaId' | 'kind'>,
-): 'measured' | 'pending' | 'unmeasurable' {
-  // A story is unmeasurable whatever is in the row: Instagram reports no
-  // likes, comments or saves for one, so printing "0 beğeni · 0 kaydetme"
-  // states a measurement that was never taken.
-  if (post.kind === 'story') return 'unmeasurable'
+): 'measured' | 'pending' | 'story' | 'unmeasurable' {
+  if (post.kind === 'story') return 'story'
   if (post.metric) return 'measured'
   return post.igMediaId ? 'pending' : 'unmeasurable'
 }
