@@ -205,10 +205,6 @@ function decodeEntities(value: string): string {
   return out.split('&amp;').join('&')
 }
 
-/** Escapes the characters a meta key could carry into a RegExp. The keys are constants today; this keeps that from becoming load-bearing. */
-function escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
 
 /**
  * The `content` of the first `<meta>` carrying `property="<key>"` or
