@@ -94,7 +94,22 @@ export function createGraphClient(): InstagramClient {
       }
 
       const { id } = await call(`/${igUserId}/media_publish`, { creation_id: creationId }, 'POST')
-      const { permalink } = await call(`/${id}`, { fields: 'permalink' }, 'GET')
+
+      // NOTHING BELOW THIS LINE MAY THROW. media_publish is the irreversible
+      // step — the post is on the account the moment it returns. The scheduler
+      // treats a throw from publish() as proof that nothing was posted and
+      // retries, so letting this separate GET fail (a 500, a 429, a socket
+      // reset) would post the same picture again on the next tick.
+      // items.permalink is nullable and Task 12 re-reads media by id, so an
+      // empty permalink is recoverable. A duplicate post is not.
+      let permalink = ''
+      try {
+        // parseGraphResponse returns `json ?? {}` on a 200, so a well-formed
+        // but empty body must not put `undefined` into a non-null column.
+        permalink = (await call(`/${id}`, { fields: 'permalink' }, 'GET')).permalink ?? ''
+      } catch (e) {
+        console.error('permalink lookup failed after publishing', id, e)
+      }
       return { igMediaId: id, permalink }
     },
 

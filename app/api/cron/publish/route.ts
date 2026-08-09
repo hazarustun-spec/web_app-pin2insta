@@ -27,8 +27,13 @@ const PREFIX = 'Bearer '
  * that fails this is a misconfiguration, and it is reported as one (503)
  * rather than silently locking the scheduler out. A trailing newline from a
  * copy-paste lands here too, which is exactly the point.
+ *
+ * Leading and trailing spaces are rejected for the same reason: HTTP strips
+ * optional whitespace from header values, so a secret with an edge space can
+ * never be matched by any header a client is able to send — the permanent,
+ * unexplained 401 this rule exists to prevent.
  */
-const ASCII_SECRET = /^[\x20-\x7e]+$/
+const ASCII_SECRET = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/
 
 /**
  * Constant-time check of `Authorization: Bearer <CRON_SECRET>`.

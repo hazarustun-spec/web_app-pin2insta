@@ -156,6 +156,8 @@ export type SlotOutcome =
   | 'claim-failed'
   | 'invalid-payload'
   | 'error'
+  /** The head item already failed earlier in this same run; its retry belongs to a later tick. */
+  | 'deferred'
   | SkipReason
 
 export type SlotResult = { date: string; index: number; outcome: SlotOutcome; itemId?: string }
@@ -211,7 +213,14 @@ async function recordFailure(db: Db, item: Candidate, e: unknown): Promise<void>
     .where(eq(items.id, item.id))
 }
 
-async function runSlot(db: Db, client: InstagramClient, now: Date, slot: SlotRef, cfg: SchedulerSettings): Promise<SlotResult> {
+async function runSlot(
+  db: Db,
+  client: InstagramClient,
+  now: Date,
+  slot: SlotRef,
+  cfg: SchedulerSettings,
+  failedThisRun: ReadonlySet<string> = new Set(),
+): Promise<SlotResult> {
   const at = (outcome: SlotOutcome, itemId?: string): SlotResult =>
     itemId === undefined
       ? { date: slot.date, index: slot.index, outcome }
@@ -234,6 +243,13 @@ async function runSlot(db: Db, client: InstagramClient, now: Date, slot: SlotRef
   }).from(items)
     .where(and(eq(items.status, 'pending'), isNull(items.postedDate)))
     .orderBy(asc(items.position), asc(items.createdAt), asc(items.id))
+
+  // A failure earlier in this same run leaves the item at the head of the queue
+  // with its attempt already spent. Leave the slot empty rather than spending
+  // the rest of the budget on the same outage.
+  if (pending.length > 0 && failedThisRun.has(pending[0].id)) {
+    return at('deferred', pending[0].id)
+  }
 
   const decision = selectForSlot(pending, cfg.hashtags)
   if (decision.action === 'skip') {
@@ -340,8 +356,17 @@ export async function runPublish(now: Date): Promise<PublishReport> {
   const cfg = resolveSettings(row)
 
   const slots: SlotResult[] = []
+  // An item that just failed must not be retried again inside the same run.
+  // Several slots can be due at once — closely spaced slot times, a cron tick
+  // that arrives late, or the spring-forward gap where two wall-clock times
+  // resolve to the same instant — and the loop re-reads the pending queue each
+  // time, so the same head item would burn its entire retry budget in one
+  // second on a single 60-second outage at Meta. Retries belong to later ticks.
+  const failedThisRun = new Set<string>()
   for (const slot of dueSlots(now, cfg.slots, cfg.timezone)) {
-    slots.push(await runSlot(db, client, now, slot, cfg))
+    const result = await runSlot(db, client, now, slot, cfg, failedThisRun)
+    if (result.outcome === 'error' && result.itemId) failedThisRun.add(result.itemId)
+    slots.push(result)
   }
   return { slots, dryRun: client.isDryRun }
 }

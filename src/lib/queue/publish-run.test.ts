@@ -515,3 +515,134 @@ describe('runPublish — two cron runs racing', () => {
     expect(state.items.filter((r) => r.postedDate !== null)).toHaveLength(1)
   })
 })
+
+describe('runPublish: retries belong to later ticks', () => {
+  // Several slots can be due at once — closely spaced slot times, a late cron
+  // tick, or the spring-forward gap. The loop re-reads the pending queue each
+  // time, so without a guard the same head item burns its whole retry budget in
+  // one second on a single brief outage at Meta.
+  it('does not retry the same item across several slots due in one run', async () => {
+    state.settings.push({
+      id: 1, slots: ['10:00', '10:20', '10:40'], timezone: 'Europe/Istanbul', hashtags: '',
+    })
+    seedItem()
+    seedImage()
+    const publish = spyClient(
+      vi.fn<(input: PublishInput) => Promise<PublishResult>>(async () => {
+        throw new InstagramError('transient', 500)
+      }),
+    )
+
+    const report = await runPublish(new Date('2026-08-10T07:45:00Z'))
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(report.slots.map((s) => s.outcome)).toEqual(['error', 'deferred', 'deferred'])
+    // One attempt spent, not three: the item survives to the next tick.
+    expect(itemRow().attempts).toBe(1)
+    expect(itemRow().status).toBe('pending')
+  })
+
+  it('still fills a later due slot from the queue when the head succeeds', async () => {
+    state.settings.push({
+      id: 1, slots: ['10:00', '10:20'], timezone: 'Europe/Istanbul', hashtags: '',
+    })
+    seedItem({ id: 'a', position: 1 })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    const publish = spyClient()
+
+    const report = await runPublish(new Date('2026-08-10T07:25:00Z'))
+
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(report.slots.map((s) => s.outcome)).toEqual(['posted', 'posted'])
+  })
+})
+
+describe('runPublish: ordering and boundaries', () => {
+  it('sends carousel images in stored position order, not query order', async () => {
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem({ kind: 'carousel' })
+    // Pushed out of order, as a real query may return them.
+    seedImage({ id: 'img-c', itemId: 'a', position: 2, url: 'https://blob.example/queue/c.jpg' })
+    seedImage({ id: 'img-a', itemId: 'a', position: 0, url: 'https://blob.example/queue/a.jpg' })
+    seedImage({ id: 'img-b', itemId: 'a', position: 1, url: 'https://blob.example/queue/b.jpg' })
+    const publish = spyClient()
+
+    await runPublish(AT_10_05)
+
+    expect(publish.mock.calls[0][0].imageUrls).toEqual([
+      'https://blob.example/queue/a.jpg',
+      'https://blob.example/queue/b.jpg',
+      'https://blob.example/queue/c.jpg',
+    ])
+  })
+
+  // Task 7 established that positions are not globally unique after a reorder,
+  // so the tiebreak is what makes the head of the queue the same item on every
+  // tick rather than whichever row the database felt like returning first.
+  it('breaks a position tie deterministically by createdAt then id', async () => {
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem({ id: 'z', position: 1, createdAt: new Date('2026-08-02T00:00:00Z') })
+    seedItem({ id: 'y', position: 1, createdAt: new Date('2026-08-01T00:00:00Z') })
+    seedImage({ itemId: 'z' })
+    seedImage({ itemId: 'y' })
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(report.slots[0]).toMatchObject({ outcome: 'posted', itemId: 'y' })
+  })
+
+  it('publishes a caption that lands exactly on the 2200 character limit', async () => {
+    const hashtags = '#one'
+    // withHashtags joins with a blank line, so the caption may use the rest.
+    const caption = 'x'.repeat(2200 - hashtags.length - 2)
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags })
+    seedItem({ caption })
+    seedImage()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots[0].outcome).toBe('posted')
+    expect(publish.mock.calls[0][0].caption).toHaveLength(2200)
+  })
+
+  it('skips a caption one character over the limit without spending an attempt', async () => {
+    const hashtags = '#one'
+    const caption = 'x'.repeat(2200 - hashtags.length - 2 + 1)
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags })
+    seedItem({ caption })
+    seedImage()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots[0].outcome).toBe('caption-too-long')
+    expect(itemRow().attempts).toBe(0)
+  })
+})
+
+describe('runPublish: thumbnail refresh never undoes a published post', () => {
+  // Without the status check, a 404 body would be handed to makeThumb and the
+  // image row would be rewritten to point at a thumbnail of an error page.
+  it('leaves the stored url alone when the blob fetch answers a non-2xx', async () => {
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem()
+    const original = String(seedImage().url)
+    spyClient()
+    fetchSpy.mockResolvedValue(new Response('not found', { status: 404 }))
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots[0].outcome).toBe('posted')
+    expect(itemRow().status).toBe('posted')
+    expect(makeThumb).not.toHaveBeenCalled()
+    expect(uploadImage).not.toHaveBeenCalled()
+    expect(deleteImage).not.toHaveBeenCalled()
+    expect(state.images[0].url).toBe(original)
+  })
+})

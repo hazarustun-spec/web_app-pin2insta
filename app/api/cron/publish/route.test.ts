@@ -100,6 +100,27 @@ describe('POST /api/cron/publish — authorisation', () => {
     expect(runPublish).not.toHaveBeenCalled()
   })
 
+  // HTTP strips optional whitespace from header values, so a secret with a
+  // leading or trailing space can never be matched by any header a client is
+  // able to send. Left alone it is a permanent, unexplained 401 — exactly the
+  // lockout the ASCII rule exists to prevent, so it is a 503 too.
+  it.each([[' leading'], ['trailing '], [' both '], [' '], ['  ']])(
+    'refuses a secret with edge whitespace (%j) rather than 401ing forever',
+    async (bad) => {
+      process.env.CRON_SECRET = bad
+      // Send the value a real client would produce: HTTP has already trimmed it.
+      const res = await POST(request(`Bearer ${bad.trim()}`))
+      expect(res.status).toBe(503)
+      expect(runPublish).not.toHaveBeenCalled()
+    },
+  )
+
+  it('still accepts a secret with an interior space', async () => {
+    process.env.CRON_SECRET = 'two words'
+    const res = await POST(request('Bearer two words'))
+    expect(res.status).toBe(200)
+  })
+
   it('survives an enormous header', async () => {
     const res = await POST(request(`Bearer ${'x'.repeat(100_000)}`))
     expect(res.status).toBe(401)

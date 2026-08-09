@@ -137,3 +137,86 @@ describe('graph client', () => {
     ).rejects.toThrow('creating 2 of 3')
   })
 })
+
+// media_publish is the point of no return: the post is on the account the
+// moment it returns. The scheduler treats a throw from publish() as proof that
+// nothing was posted and retries, so anything that throws after this step
+// causes the same picture to be posted again on the next tick.
+describe('graph client publish irreversibility', () => {
+  beforeEach(() => {
+    process.env.IG_ACCESS_TOKEN = 'secret-token-value'
+    process.env.IG_USER_ID = 'ig-user-1'
+  })
+  afterEach(() => {
+    global.fetch = originalFetch
+    delete process.env.IG_ACCESS_TOKEN
+    delete process.env.IG_USER_ID
+  })
+
+  /** Succeeds through media_publish, then fails the permalink lookup. */
+  function publishThenPermalinkFails(permalinkStatus: number) {
+    const calls: string[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      calls.push(`${init?.method ?? 'GET'} ${url.split('v25.0')[1] ?? url}`)
+      if (url.includes('fields=permalink')) {
+        return jsonResponse(permalinkStatus, { error: { message: 'transient' } })
+      }
+      if (url.includes('media_publish')) return jsonResponse(200, { id: 'media-1' })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+    return calls
+  }
+
+  it.each([[500], [429], [400]])(
+    'returns the media id instead of throwing when the permalink lookup answers %i',
+    async (status) => {
+      const calls = publishThenPermalinkFails(status)
+      const client = createGraphClient()
+
+      const result = await client.publish({
+        kind: 'feed',
+        imageUrls: ['https://example.com/a.jpg'],
+        caption: 'hello',
+      })
+
+      expect(result.igMediaId).toBe('media-1')
+      expect(result.permalink).toBe('')
+      expect(calls.filter((c) => c.includes('media_publish'))).toHaveLength(1)
+    },
+  )
+
+  it('still returns the permalink when the lookup succeeds', async () => {
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('fields=permalink')) {
+        return jsonResponse(200, { permalink: 'https://instagram.com/p/abc' })
+      }
+      if (url.includes('media_publish')) return jsonResponse(200, { id: 'media-1' })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+
+    const result = await createGraphClient().publish({
+      kind: 'feed',
+      imageUrls: ['https://example.com/a.jpg'],
+      caption: 'hello',
+    })
+    expect(result).toEqual({ igMediaId: 'media-1', permalink: 'https://instagram.com/p/abc' })
+  })
+
+  it('does throw when media_publish itself fails, since nothing was posted', async () => {
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('media_publish')) return jsonResponse(500, { error: { message: 'boom' } })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+
+    await expect(
+      createGraphClient().publish({
+        kind: 'feed',
+        imageUrls: ['https://example.com/a.jpg'],
+        caption: 'hello',
+      }),
+    ).rejects.toBeInstanceOf(InstagramError)
+  })
+})
