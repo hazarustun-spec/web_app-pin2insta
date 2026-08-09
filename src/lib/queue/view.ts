@@ -1,4 +1,5 @@
 import { localDate, upcomingSlots, type SlotRef } from './slots'
+import { isPinUrl } from '../pinterest'
 
 /**
  * Pure view logic for the queue page.
@@ -9,7 +10,8 @@ import { localDate, upcomingSlots, type SlotRef } from './slots'
  * environment without a DOM stack.
  *
  * IMPORTANT: this module is imported by client components, so it may only
- * import browser-safe code. `./slots` (which pulls `@date-fns/tz`) qualifies;
+ * import browser-safe code. `./slots` (which pulls `@date-fns/tz`) and `../pinterest`
+ * (deliberately free of Node APIs) qualify;
  * `./repo` and `./publish` do not — they reach for the database, `sharp` and
  * the Blob SDK.
  */
@@ -438,4 +440,50 @@ export function describeUploadResults(results: UploadResult[]): Note[] {
     notes.push({ tone: 'error', text: `ve ${errors.length - MAX_NAMED_ERRORS} dosya daha yüklenemedi` })
   }
   return notes
+}
+
+// ---------------------------------------------------------------------------
+// Paste-to-ingest (Task 11)
+// ---------------------------------------------------------------------------
+
+/**
+ * True when a paste belongs to whatever the owner is typing in.
+ *
+ * The Pinterest paste listener is on `window`, so it fires for every paste on
+ * the page. Without this, pasting a pin link into a caption box would ingest
+ * the pin INSTEAD of pasting the text — the caption would silently not receive
+ * what the owner pasted.
+ *
+ * Duck-typed rather than `instanceof HTMLElement` so it can be tested in the
+ * node environment the rest of this module is tested in.
+ */
+export function isTypingTarget(target: unknown): boolean {
+  if (typeof target !== 'object' || target === null) return false
+  const el = target as {
+    tagName?: unknown
+    isContentEditable?: unknown
+    closest?: (selector: string) => unknown
+  }
+  if (el.isContentEditable === true) return true
+  const tag = typeof el.tagName === 'string' ? el.tagName.toUpperCase() : ''
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  // A paste inside a rich-text area can land on a child node whose own
+  // isContentEditable is not set.
+  if (typeof el.closest === 'function') {
+    return el.closest('[contenteditable]:not([contenteditable="false"])') != null
+  }
+  return false
+}
+
+/**
+ * The pin URL in a pasted clipboard string, or null.
+ *
+ * Deliberately the SAME guard the route applies (`isPinUrl`), not a loose
+ * `/pinterest\./` test: a lookalike host like `pinterest.com.evil.com` should
+ * not even produce a request, and a paste that merely mentions Pinterest in a
+ * sentence is text, not a link.
+ */
+export function pastedPinUrl(text: string): string | null {
+  const trimmed = text.trim()
+  return isPinUrl(trimmed) ? trimmed : null
 }

@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Dropzone, type UploadProgress } from './Dropzone'
 import { QueueGrid } from './QueueGrid'
@@ -9,7 +9,9 @@ import { SelectionBar } from './SelectionBar'
 import { uploadFiles } from '../_lib/upload'
 import {
   describeUploadResults,
+  isTypingTarget,
   moveId,
+  pastedPinUrl,
   nextCaptionlessId,
   queueStatus,
   resolveViewSettings,
@@ -142,6 +144,65 @@ export function QueueClient({
     },
     [load],
   )
+
+  /**
+   * Paste a Pinterest link anywhere on the page and the server fetches the
+   * pin's image into the queue.
+   *
+   * The listener is on `window`, so the FIRST thing it does is get out of the
+   * way of anything the owner is typing in: pasting a link into a caption box
+   * must paste text, not start an ingest. `pastedPinUrl` then applies the same
+   * host guard the route does, so a lookalike host never even produces a
+   * request.
+   *
+   * Feedback is the dropzone's: the same "yükleniyor… 0/1" counter while it
+   * runs and the same result notes afterwards — including the
+   * download-it-and-drop-it-instead message, which is the EXPECTED outcome
+   * whenever Pinterest declines to serve the page to a server.
+   */
+  useEffect(() => {
+    async function onPaste(e: ClipboardEvent) {
+      if (isTypingTarget(e.target)) return
+      const url = pastedPinUrl(e.clipboardData?.getData('text') ?? '')
+      if (!url) return
+
+      const fallback = 'Pinterest görseli alınamadı — görseli indirip sürükle'
+      setProgress({ done: 0, total: 1 })
+      try {
+        const res = await fetch('/api/items/pin', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ url }),
+        })
+        if (res.status === 401) {
+          router.push('/login')
+          return
+        }
+        const body = (await res.json().catch(() => null)) as
+          | { status?: string; name?: string; error?: string }
+          | null
+        const name = typeof body?.name === 'string' ? body.name : url
+        // Read straight off the parsed body, NOT through `reason()`: the body
+        // is already consumed here, and a second res.json() would throw and
+        // swallow the very sentence that says what to do next.
+        const message = typeof body?.error === 'string' && body.error ? body.error : fallback
+        setNotes(
+          describeUploadResults([
+            res.ok && (body?.status === 'added' || body?.status === 'duplicate')
+              ? { status: body.status, name }
+              : { status: 'error', name, message },
+          ]),
+        )
+      } catch {
+        setNotes([{ tone: 'error', text: fallback }])
+      } finally {
+        setProgress(null)
+      }
+      await load()
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [load, router])
 
   // ── Mutations ────────────────────────────────────────────────────────────
 

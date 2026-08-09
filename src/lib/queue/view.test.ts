@@ -17,6 +17,8 @@ import {
   describeUploadResults,
   screenFile,
   chunk,
+  isTypingTarget,
+  pastedPinUrl,
   MAX_UPLOAD_BYTES,
   MAX_INGEST_BATCH,
   type ViewItem,
@@ -421,5 +423,56 @@ describe('the fixed hashtag block is part of what the page can see', () => {
     expect(labels.has('c')).toBe(false)
     // The same queue with no hashtags configured runs to the end.
     expect([...slotLabels(items, SETTINGS, now).keys()]).toEqual(['a', 'blocker', 'c'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Paste-to-ingest. The listener is on `window`, so it sees every paste on the
+// page — including the ones meant for a caption box.
+// ---------------------------------------------------------------------------
+
+describe('isTypingTarget', () => {
+  it.each([
+    ['a caption textarea', { tagName: 'TEXTAREA' }],
+    ['a text input', { tagName: 'INPUT' }],
+    ['a select', { tagName: 'SELECT' }],
+    ['a lowercase tagName', { tagName: 'textarea' }],
+    ['a contenteditable element', { tagName: 'DIV', isContentEditable: true }],
+    ['a node inside a contenteditable', { tagName: 'SPAN', closest: () => ({}) }],
+  ])('claims %s', (_label, target) => {
+    expect(isTypingTarget(target)).toBe(true)
+  })
+
+  it.each([
+    ['a plain div', { tagName: 'DIV', closest: () => null }],
+    ['the body', { tagName: 'BODY' }],
+    ['a node with no editable ancestor', { tagName: 'SPAN', closest: () => null }],
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'TEXTAREA'],
+  ])('does not claim %s', (_label, target) => {
+    expect(isTypingTarget(target)).toBe(false)
+  })
+})
+
+describe('pastedPinUrl', () => {
+  it.each([
+    ['a pin url', 'https://tr.pinterest.com/pin/12345/'],
+    ['a pin url with surrounding whitespace', '  https://www.pinterest.com/pin/1/\n'],
+    ['a shortener link', 'https://pin.it/abc'],
+  ])('accepts %s', (_label, text) => {
+    expect(pastedPinUrl(text)).toBe(text.trim())
+  })
+
+  it.each([
+    ['plain text', 'merhaba'],
+    ['a sentence mentioning pinterest', 'bak şuna https://tr.pinterest.com/pin/1/ güzelmiş'],
+    ['some other link', 'https://example.com/pin/1'],
+    // The client filter uses the SAME guard as the server, so a lookalike host
+    // never even produces a request.
+    ['a lookalike host', 'https://pinterest.com.evil.com/pin/1'],
+    ['an empty clipboard', ''],
+  ])('ignores %s', (_label, text) => {
+    expect(pastedPinUrl(text)).toBe(null)
   })
 })
