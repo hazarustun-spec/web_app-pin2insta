@@ -1,0 +1,517 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import {
+  InstagramError,
+  type InstagramClient, type PublishInput, type PublishResult,
+} from '@/src/lib/instagram/types'
+import { state, resetDb, type Row } from './__fixtures__/fake-db'
+
+/**
+ * `runPublish` against a database fake that evaluates `where` clauses and
+ * enforces `items_slot_unique_idx` — see __fixtures__/fake-db.ts. Blob storage,
+ * sharp and the network are mocked; the Instagram client defaults to the REAL
+ * dry-run client, which is the only client this project has until an account
+ * exists, so the happy path here is a genuine end-to-end dry run.
+ */
+
+vi.mock('@/src/db', () => import('./__fixtures__/fake-db'))
+
+const uploadImage = vi.hoisted(() => vi.fn())
+const deleteImage = vi.hoisted(() => vi.fn())
+const makeThumb = vi.hoisted(() => vi.fn())
+/** null → the module's own getInstagramClient(), i.e. the dry-run client. */
+const clientOverride = vi.hoisted(() => ({ value: null as InstagramClient | null }))
+
+vi.mock('@/src/lib/images/storage', () => ({ uploadImage, deleteImage }))
+vi.mock('@/src/lib/images/process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/src/lib/images/process')>()),
+  makeThumb,
+}))
+vi.mock('@/src/lib/instagram', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/src/lib/instagram')>()
+  return { ...actual, getInstagramClient: () => clientOverride.value ?? actual.getInstagramClient() }
+})
+
+const { runPublish, MAX_ATTEMPTS } = await import('./publish')
+
+// 10:05 in Europe/Istanbul (UTC+3, no DST) on 2026-08-10 — five minutes into
+// the first default slot, which is where a 15-minute cron tick lands.
+const AT_10_05 = new Date('2026-08-10T07:05:00Z')
+const TODAY = '2026-08-10'
+
+function seedItem(over: Partial<Row> = {}): Row {
+  const row: Row = {
+    id: 'a', kind: 'feed', caption: 'a caption', position: 1, status: 'pending',
+    attempts: 0, error: null, postedDate: null, slotIndex: null,
+    igMediaId: null, permalink: null, postedAt: null,
+    createdAt: new Date('2026-08-01T00:00:00Z'),
+    ...over,
+  }
+  state.items.push(row)
+  return row
+}
+
+function seedImage(over: Partial<Row> = {}): Row {
+  const row: Row = {
+    id: `img-${state.images.length + 1}`, itemId: 'a', hash: `hash${state.images.length + 1}`,
+    url: `https://blob.example/queue/hash${state.images.length + 1}.jpg`,
+    pathname: `queue/hash${state.images.length + 1}.jpg`, position: 0,
+    createdAt: new Date('2026-08-01T00:00:00Z'),
+    ...over,
+  }
+  state.images.push(row)
+  return row
+}
+
+const okPublish = () =>
+  vi.fn<(input: PublishInput) => Promise<PublishResult>>(
+    async () => ({ igMediaId: 'ig-1', permalink: 'https://p/1' }),
+  )
+
+/** A client that records its calls; `publish` defaults to a successful post. */
+function spyClient(publish = okPublish()) {
+  const client: InstagramClient = { isDryRun: true, publish, insights: vi.fn() }
+  clientOverride.value = client
+  return publish
+}
+
+const itemRow = (id = 'a') => state.items.find((r) => r.id === id)!
+const savedIgEnv = { token: process.env.IG_ACCESS_TOKEN, user: process.env.IG_USER_ID }
+
+let fetchSpy: ReturnType<typeof vi.spyOn>
+
+beforeEach(() => {
+  resetDb()
+  clientOverride.value = null
+  // Guarantees getInstagramClient() returns the dry-run client: a live token in
+  // the environment would make these tests post to a real account.
+  delete process.env.IG_ACCESS_TOKEN
+  delete process.env.IG_USER_ID
+  uploadImage.mockReset().mockResolvedValue({ url: 'https://blob.example/thumb/t.jpg', pathname: 'thumb/t.jpg' })
+  deleteImage.mockReset().mockResolvedValue(undefined)
+  makeThumb.mockReset().mockResolvedValue(Buffer.from('thumb-bytes'))
+  // Fail closed on the network; the thumbnail fetch is opted into per test.
+  fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected fetch'))
+  vi.spyOn(console, 'log').mockImplementation(() => {})
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  if (savedIgEnv.token === undefined) delete process.env.IG_ACCESS_TOKEN
+  else process.env.IG_ACCESS_TOKEN = savedIgEnv.token
+  if (savedIgEnv.user === undefined) delete process.env.IG_USER_ID
+  else process.env.IG_USER_ID = savedIgEnv.user
+})
+
+// A fresh Response per call: a body can only be read once, so a shared
+// instance would make the second image of a carousel fail for the wrong reason.
+const okFetch = () => fetchSpy.mockImplementation(async () => new Response(new Uint8Array([1, 2, 3])))
+
+describe('runPublish — the happy path on a fresh database', () => {
+  it('posts the head of the queue into the due slot with no settings row at all', async () => {
+    // Task 10 owns the settings UI and has not run: `settings` is EMPTY here.
+    seedItem()
+    seedImage()
+    okFetch()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.dryRun).toBe(true)
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({
+      status: 'posted',
+      postedDate: TODAY,
+      slotIndex: 0,
+      postedAt: AT_10_05,
+      error: null,
+      attempts: 0,
+    })
+    expect(String(itemRow().igMediaId)).toMatch(/^dryrun-\d+$/)
+    expect(String(itemRow().permalink)).toContain('dryrun=1')
+  })
+
+  it('appends the configured hashtags to the caption it publishes', async () => {
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '#one #two' })
+    seedItem({ caption: 'a caption' })
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+
+    await runPublish(AT_10_05)
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(publish.mock.calls[0][0].caption).toBe('a caption\n\n#one #two')
+  })
+
+  it('honours the settings row rather than the defaults', async () => {
+    // 09:05 in Europe/London (BST) — a time that is NOT a default slot, in a
+    // timezone that is not the default either.
+    state.settings.push({ id: 1, slots: ['09:00'], timezone: 'Europe/London', hashtags: '' })
+    seedItem()
+    seedImage()
+    okFetch()
+
+    const report = await runPublish(new Date('2026-08-10T08:05:00Z'))
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+  })
+
+  it('swaps the full-size blob for a thumbnail and deletes the original', async () => {
+    seedItem()
+    // Captured now: the row object is the store's own, and the publisher is
+    // about to rewrite its url.
+    const originalUrl = String(seedImage().url)
+    okFetch()
+
+    await runPublish(AT_10_05)
+
+    expect(makeThumb).toHaveBeenCalledTimes(1)
+    expect(uploadImage).toHaveBeenCalledWith(Buffer.from('thumb-bytes'), 'thumb/hash1.jpg')
+    expect(state.images[0]).toMatchObject({ url: 'https://blob.example/thumb/t.jpg', pathname: 'thumb/t.jpg' })
+    expect(deleteImage).toHaveBeenCalledWith(originalUrl)
+  })
+
+  it('fills each due slot with a different item, oldest slot first', async () => {
+    state.settings.push({ id: 1, slots: ['10:00', '10:30'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem({ id: 'a', position: 1 })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+
+    // 10:35 Istanbul: both slots are inside dueSlots' 90-minute grace window.
+    const report = await runPublish(new Date('2026-08-10T07:35:00Z'))
+
+    expect(report.slots).toEqual([
+      { date: TODAY, index: 0, outcome: 'posted', itemId: 'a' },
+      { date: TODAY, index: 1, outcome: 'posted', itemId: 'b' },
+    ])
+    expect(itemRow('a')).toMatchObject({ slotIndex: 0 })
+    expect(itemRow('b')).toMatchObject({ slotIndex: 1 })
+  })
+})
+
+describe('runPublish — idempotence', () => {
+  it('does not post again when the slot is already filled', async () => {
+    seedItem()
+    seedImage()
+    okFetch()
+    await runPublish(AT_10_05)
+
+    const publish = spyClient()
+    const second = await runPublish(new Date('2026-08-10T07:20:00Z'))
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(second.slots).toEqual([{ date: TODAY, index: 0, outcome: 'already-filled' }])
+  })
+
+  it('does not backfill a slot that went by more than the grace window ago', async () => {
+    seedItem()
+    seedImage()
+    const publish = spyClient()
+
+    // 12:00 Istanbul: two hours after 10:00 and two before 14:00.
+    const report = await runPublish(new Date('2026-08-10T09:00:00Z'))
+
+    expect(report.slots).toEqual([])
+    expect(publish).not.toHaveBeenCalled()
+    expect(itemRow()).toMatchObject({ status: 'pending', postedDate: null })
+  })
+
+  it('treats a claim that matches no rows as a lost race, not as permission to post', async () => {
+    // THE defect the plan shipped: `UPDATE ... WHERE posted_date IS NULL` that
+    // matches zero rows throws nothing. Here another cron run commits its claim
+    // in exactly that window.
+    seedItem()
+    seedImage()
+    const publish = spyClient()
+    state.beforeUpdate = (values) => {
+      if (values.postedDate) {
+        state.beforeUpdate = null
+        itemRow().postedDate = TODAY
+        itemRow().slotIndex = 0
+      }
+    }
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'race-lost', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, error: null })
+  })
+
+  it('treats the unique-index violation on the slot as a lost race', async () => {
+    seedItem()
+    seedImage()
+    const publish = spyClient()
+    // A second item took (date, index) between the "already filled?" read and
+    // this claim, so the index — not our own read — is what stops us.
+    state.beforeUpdate = (values) => {
+      if (values.postedDate) {
+        state.beforeUpdate = null
+        state.items.push({ id: 'z', status: 'posted', postedDate: TODAY, slotIndex: 0, position: 9 })
+      }
+    }
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'race-lost', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, postedDate: null })
+  })
+})
+
+describe('runPublish — a post that has already happened is never undone', () => {
+  it('records the post before doing any thumbnail work', async () => {
+    seedItem()
+    seedImage()
+    okFetch()
+
+    await runPublish(AT_10_05)
+
+    const postedAt = state.trace.findIndex((t) => t.table === 'items' && t.values?.status === 'posted')
+    const thumbAt = state.trace.findIndex((t) => t.table === 'images')
+    expect(postedAt).toBeGreaterThanOrEqual(0)
+    expect(thumbAt).toBeGreaterThan(postedAt)
+  })
+
+  it('keeps the item posted when the thumbnail fetch throws afterwards', async () => {
+    // The plan ran this inside the publish try/catch, so a failed fetch cleared
+    // the slot claim and left the item pending — the next tick posted the same
+    // picture again.
+    seedItem()
+    seedImage()
+    fetchSpy.mockRejectedValue(new Error('blob store unreachable'))
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({
+      status: 'posted', postedDate: TODAY, slotIndex: 0, attempts: 0, error: null,
+    })
+    expect(deleteImage).not.toHaveBeenCalled()
+  })
+
+  it('keeps the item posted when the thumbnail upload throws afterwards', async () => {
+    seedItem()
+    seedImage()
+    okFetch()
+    uploadImage.mockRejectedValue(new Error('blob quota exceeded'))
+
+    await runPublish(AT_10_05)
+
+    expect(itemRow()).toMatchObject({ status: 'posted', attempts: 0, error: null })
+    expect(state.images[0].url).toBe('https://blob.example/queue/hash1.jpg')
+    expect(deleteImage).not.toHaveBeenCalled()
+  })
+
+  it('keeps the surviving images when one image of a carousel fails to thumbnail', async () => {
+    seedItem({ kind: 'carousel' })
+    seedImage({ id: 'img-1', position: 0 })
+    seedImage({ id: 'img-2', position: 1 })
+    okFetch()
+    makeThumb.mockRejectedValueOnce(new Error('decode failed'))
+
+    await runPublish(AT_10_05)
+
+    expect(itemRow()).toMatchObject({ status: 'posted' })
+    expect(state.images[0].url).toBe('https://blob.example/queue/hash1.jpg')
+    expect(state.images[1].url).toBe('https://blob.example/thumb/t.jpg')
+  })
+
+  it('leaves the slot claim in place when the "posted" write itself fails', async () => {
+    // Instagram has the post. The row cannot say so, but the claim it already
+    // holds is what keeps the next tick from selecting it again.
+    seedItem()
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+    state.failUpdate = (t) => (t.values?.status === 'posted' ? new Error('connection reset') : null)
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted-unrecorded', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ postedDate: TODAY, slotIndex: 0, attempts: 0 })
+
+    // The next tick must not republish it: the claim excludes it from the
+    // pending query and fills the slot.
+    state.failUpdate = null
+    const publish2 = spyClient()
+    const second = await runPublish(new Date('2026-08-10T07:20:00Z'))
+    expect(publish2).not.toHaveBeenCalled()
+    expect(second.slots).toEqual([{ date: TODAY, index: 0, outcome: 'already-filled' }])
+  })
+})
+
+describe('runPublish — failures', () => {
+  it('releases the slot, counts the attempt and stores the reason', async () => {
+    seedItem()
+    seedImage()
+    spyClient(okPublish().mockRejectedValue(new InstagramError('media container failed')))
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'error', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({
+      status: 'pending', attempts: 1, postedDate: null, slotIndex: null,
+      error: 'media container failed',
+    })
+  })
+
+  it('marks the item failed on the last attempt so it stops blocking the queue', async () => {
+    seedItem({ attempts: MAX_ATTEMPTS - 1 })
+    seedImage()
+    spyClient(okPublish().mockRejectedValue(new InstagramError('still broken')))
+
+    await runPublish(AT_10_05)
+
+    expect(itemRow()).toMatchObject({ status: 'failed', attempts: MAX_ATTEMPTS })
+  })
+
+  it('never stores a driver message in the column the queue page displays', async () => {
+    seedItem()
+    seedImage()
+    spyClient(okPublish().mockRejectedValue(new Error('getaddrinfo ENOTFOUND ep-x.eu-central-1.aws.neon.tech')))
+
+    await runPublish(AT_10_05)
+
+    expect(String(itemRow().error)).not.toContain('neon.tech')
+    expect(itemRow().attempts).toBe(1)
+  })
+
+  it('reports a claim that failed for a reason other than a race, and leaves the item alone', async () => {
+    seedItem()
+    seedImage()
+    const publish = spyClient()
+    state.failUpdate = (t) => (t.values?.postedDate ? new Error('connection reset') : null)
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'claim-failed', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, postedDate: null })
+  })
+
+  it('a released item is picked up again by the next tick', async () => {
+    seedItem()
+    seedImage()
+    spyClient(okPublish().mockRejectedValue(new InstagramError('transient')))
+    await runPublish(AT_10_05)
+
+    okFetch()
+    clientOverride.value = null
+    const second = await runPublish(new Date('2026-08-10T07:20:00Z'))
+
+    expect(second.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ status: 'posted', attempts: 1, error: null })
+  })
+})
+
+describe('runPublish — skips that cost no attempt', () => {
+  it('reports an empty queue', async () => {
+    const report = await runPublish(AT_10_05)
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'empty-queue' }])
+  })
+
+  it('reports a caption-less head item without claiming or counting it', async () => {
+    seedItem({ caption: '  ' })
+    seedImage()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'missing-caption', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ attempts: 0, postedDate: null, status: 'pending' })
+  })
+
+  it('reports a caption the hashtags push over the limit without burning an attempt', async () => {
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '#tag' })
+    seedItem({ caption: 'x'.repeat(2198) })
+    seedImage()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'caption-too-long', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ attempts: 0, status: 'pending' })
+  })
+
+  it('skips a payload Instagram would reject instead of retrying it three times', async () => {
+    // A carousel holding one image can never publish; three ticks would burn
+    // all three attempts and mark it failed for a reason no retry addresses.
+    seedItem({ kind: 'carousel' })
+    seedImage()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'invalid-payload', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ attempts: 0, status: 'pending', postedDate: null })
+  })
+
+  it('leaves the slot empty rather than reaching past a blocked head item', async () => {
+    seedItem({ id: 'a', position: 1, caption: '' })
+    seedItem({ id: 'b', position: 2, caption: 'ready to go' })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'missing-caption', itemId: 'a' }])
+  })
+})
+
+describe('runPublish — two cron runs racing', () => {
+  it('publishes exactly once when two runs start together on one item', async () => {
+    seedItem()
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+
+    const [first, second] = await Promise.all([runPublish(AT_10_05), runPublish(AT_10_05)])
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    const outcomes = [first.slots[0].outcome, second.slots[0].outcome].sort()
+    expect(outcomes).toEqual(['posted', 'race-lost'])
+    expect(state.items.filter((r) => r.postedDate !== null)).toHaveLength(1)
+    expect(itemRow()).toMatchObject({ status: 'posted', slotIndex: 0, attempts: 0 })
+  })
+
+  it('fills the slot once when two runs start together on a two-item queue', async () => {
+    seedItem({ id: 'a', position: 1 })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+    const publish = spyClient()
+
+    const [first, second] = await Promise.all([runPublish(AT_10_05), runPublish(AT_10_05)])
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect([first.slots[0].outcome, second.slots[0].outcome].sort()).toEqual(['posted', 'race-lost'])
+    // The loser must not have posted `b` into a slot that already holds `a`.
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(1)
+    expect(itemRow('b')).toMatchObject({ status: 'pending', postedDate: null, attempts: 0 })
+  })
+
+  it('publishes exactly once across four simultaneous runs', async () => {
+    seedItem()
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+
+    const reports = await Promise.all([
+      runPublish(AT_10_05), runPublish(AT_10_05), runPublish(AT_10_05), runPublish(AT_10_05),
+    ])
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(reports.filter((r) => r.slots[0].outcome === 'posted')).toHaveLength(1)
+    expect(state.items.filter((r) => r.postedDate !== null)).toHaveLength(1)
+  })
+})

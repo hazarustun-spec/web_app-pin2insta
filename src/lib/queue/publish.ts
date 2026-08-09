@@ -1,0 +1,347 @@
+import { and, asc, eq, isNull } from 'drizzle-orm'
+import { getDb } from '@/src/db'
+import { items, images, settings } from '@/src/db/schema'
+import { getInstagramClient } from '@/src/lib/instagram'
+import {
+  InstagramError, validate,
+  type InstagramClient, type PublishInput, type PublishResult,
+} from '@/src/lib/instagram/types'
+import { makeThumb } from '@/src/lib/images/process'
+import { uploadImage, deleteImage } from '@/src/lib/images/storage'
+import { dueSlots, type SlotRef } from './slots'
+import { MAX_CAPTION_CHARS } from './repo'
+
+/** Retries per item before it is marked `failed` and stops blocking the queue. */
+export const MAX_ATTEMPTS = 3
+
+/** Ceiling on what we store in `items.error`, which the queue page displays. */
+export const MAX_ERROR_CHARS = 300
+
+export type SkipReason = 'empty-queue' | 'missing-caption' | 'exhausted' | 'caption-too-long'
+
+export type Selection =
+  | { action: 'publish'; itemId: string }
+  | { action: 'skip'; reason: 'empty-queue' }
+  | { action: 'skip'; reason: Exclude<SkipReason, 'empty-queue'>; itemId: string }
+
+/**
+ * The subset of an `items` row the decision needs. Selecting exactly these
+ * columns is what lets `runPublish` hand real rows to `selectForSlot` without
+ * casting — the plan's `pending as never` laundered a type mismatch instead.
+ */
+export type Candidate = {
+  id: string
+  caption: string
+  kind: 'feed' | 'carousel' | 'story'
+  attempts: number
+  position: number
+}
+
+/**
+ * The caption as Instagram will see it: the owner's text, then a blank line,
+ * then the global hashtag block.
+ */
+export function withHashtags(caption: string, hashtags: string): string {
+  const tags = hashtags.trim()
+  const base = caption.trim()
+  if (!tags) return base
+  if (!base) return tags
+  return `${base}\n\n${tags}`
+}
+
+/**
+ * Pure decision: given the pending queue, what should this slot do?
+ *
+ * DECISIONS:
+ * - Only the HEAD of the queue is ever considered. Skipping past an item that
+ *   cannot publish to one that can would silently reorder the queue, and queue
+ *   order is the owner's stated intent. A blocked head means the slot goes
+ *   empty and the report names the item — a product decision, not a bug.
+ * - `hashtags` is part of the caption length test because `validate()` measures
+ *   the composed caption. A caption that only breaks 2200 characters once the
+ *   hashtags are appended is not retryable, so it must never reach a claim:
+ *   three cron ticks would burn all three attempts and mark the item failed.
+ */
+export function selectForSlot(pending: Candidate[], hashtags = ''): Selection {
+  // Stable sort, so rows that tie on position keep the order the query gave.
+  const next = [...pending].sort((a, b) => a.position - b.position)[0]
+  if (!next) return { action: 'skip', reason: 'empty-queue' }
+  if (next.attempts >= MAX_ATTEMPTS) return { action: 'skip', reason: 'exhausted', itemId: next.id }
+  if (next.kind !== 'story' && !next.caption.trim()) {
+    return { action: 'skip', reason: 'missing-caption', itemId: next.id }
+  }
+  if (withHashtags(next.caption, hashtags).length > MAX_CAPTION_CHARS) {
+    return { action: 'skip', reason: 'caption-too-long', itemId: next.id }
+  }
+  return { action: 'publish', itemId: next.id }
+}
+
+export type SchedulerSettings = { slots: string[]; timezone: string; hashtags: string }
+
+/** The `settings` table's own column defaults, repeated here for the case where the row does not exist yet. */
+export const DEFAULT_SETTINGS: SchedulerSettings = {
+  slots: ['10:00', '14:00', '20:00'],
+  timezone: 'Europe/Istanbul',
+  hashtags: '',
+}
+
+const TIME_RE = /^([01][0-9]|2[0-3]):[0-5][0-9]$/
+
+function isKnownTimeZone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: tz })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Settings the scheduler can actually run on.
+ *
+ * `db.select()` returns an EMPTY ARRAY when the settings row has never been
+ * written, which is every deployment until the settings UI (Task 10) is used —
+ * the plan's `cfg.slots` throws there and the cron run dies before it looks at
+ * a single slot. Field-level fallbacks matter for the same reason: a bad
+ * timezone makes `slotAt` throw and a malformed time makes it produce an
+ * Invalid Date, either of which takes down the whole run rather than one slot.
+ */
+export function resolveSettings(row: Partial<SchedulerSettings> | undefined | null): SchedulerSettings {
+  const slots = row?.slots
+  const timezone = row?.timezone
+  const hashtags = row?.hashtags
+  return {
+    slots:
+      Array.isArray(slots) && slots.length > 0 && slots.every((s) => typeof s === 'string' && TIME_RE.test(s))
+        ? slots
+        : DEFAULT_SETTINGS.slots,
+    timezone:
+      typeof timezone === 'string' && timezone !== '' && isKnownTimeZone(timezone)
+        ? timezone
+        : DEFAULT_SETTINGS.timezone,
+    hashtags: typeof hashtags === 'string' ? hashtags : DEFAULT_SETTINGS.hashtags,
+  }
+}
+
+/**
+ * What goes into `items.error`, which the queue page shows the owner.
+ *
+ * Same contract as `QueueError`/`IngestError` in repo.ts: exactly one error
+ * type carries a message written about the post, and it is the only one stored
+ * verbatim. A Drizzle, Neon, Blob or DNS failure can carry a connection string,
+ * a hostname or a token fragment; those are logged server-side and stored as a
+ * fixed sentence. The plan wrote `(e as Error).message` into this column.
+ */
+export function describeFailure(e: unknown): string {
+  if (e instanceof InstagramError) {
+    // \p{Cc}\p{Cf} rather than a literal control-character class: the same
+    // set, plus the bidi overrides that can reorder text on screen.
+    const flat = e.message.replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/g, ' ').trim()
+    if (flat) return flat.slice(0, MAX_ERROR_CHARS)
+  }
+  return 'paylaşılamadı — sunucu günlüklerine bakın'
+}
+
+// ---------------------------------------------------------------------------
+// The run loop.
+// ---------------------------------------------------------------------------
+
+/** What happened to one due slot. */
+export type SlotOutcome =
+  | 'posted'
+  /** Instagram accepted the post but the row could not be updated to say so. */
+  | 'posted-unrecorded'
+  | 'already-filled'
+  | 'race-lost'
+  | 'claim-failed'
+  | 'invalid-payload'
+  | 'error'
+  | SkipReason
+
+export type SlotResult = { date: string; index: number; outcome: SlotOutcome; itemId?: string }
+
+export type PublishReport = { slots: SlotResult[]; dryRun: boolean }
+
+type Db = ReturnType<typeof getDb>
+type ImageRow = { id: string; url: string; hash: string }
+
+/** Postgres unique_violation on the slot index — the same shape repo.ts reads for the image-hash index. */
+function isSlotTaken(e: unknown): boolean {
+  const err = e as { code?: string; constraint?: string } | null
+  return err?.code === '23505' && err?.constraint === 'items_slot_unique_idx'
+}
+
+/**
+ * Replaces each full-size blob with a thumbnail once the post is live.
+ *
+ * BEST EFFORT, ALWAYS. This runs AFTER the item is recorded as posted, and
+ * nothing it does can change that record. The plan ran it inside the same
+ * try/catch as `client.publish()`, so a failed fetch cleared the slot claim,
+ * incremented `attempts` and left the item pending — and the next cron tick
+ * published the same picture to the account a second time.
+ *
+ * The original blob is deleted only after the row points at the thumbnail; the
+ * other order leaves `images.url` referencing an object that no longer exists.
+ */
+async function refreshThumbnails(db: Db, imgs: ImageRow[]): Promise<void> {
+  for (const img of imgs) {
+    try {
+      const res = await fetch(img.url)
+      if (!res.ok) throw new Error(`blob fetch failed with ${res.status}`)
+      const full = Buffer.from(await res.arrayBuffer())
+      const thumb = await uploadImage(await makeThumb(full), `thumb/${img.hash}.jpg`)
+      await db.update(images)
+        .set({ url: thumb.url, pathname: thumb.pathname })
+        .where(eq(images.id, img.id))
+      await deleteImage(img.url).catch((e) => console.error('blob cleanup failed:', e))
+    } catch (e) {
+      // A surviving full-size blob costs storage. Undoing a published post is
+      // not on the menu, so this failure is logged and nothing else.
+      console.error('thumbnail refresh failed for image', img.id, e)
+    }
+  }
+}
+
+/** Releases the slot claim, counts the attempt, and retires the item once it has used them all. */
+async function recordFailure(db: Db, item: Candidate, e: unknown): Promise<void> {
+  const attempts = item.attempts + 1
+  const status: 'pending' | 'failed' = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending'
+  await db.update(items)
+    .set({ postedDate: null, slotIndex: null, attempts, error: describeFailure(e), status })
+    .where(eq(items.id, item.id))
+}
+
+async function runSlot(db: Db, client: InstagramClient, now: Date, slot: SlotRef, cfg: SchedulerSettings): Promise<SlotResult> {
+  const at = (outcome: SlotOutcome, itemId?: string): SlotResult =>
+    itemId === undefined
+      ? { date: slot.date, index: slot.index, outcome }
+      : { date: slot.date, index: slot.index, outcome, itemId }
+
+  const filled = await db.select({ id: items.id }).from(items)
+    .where(and(eq(items.postedDate, slot.date), eq(items.slotIndex, slot.index)))
+  if (filled.length > 0) return at('already-filled')
+
+  // Exactly the columns selectForSlot needs, so real rows satisfy `Candidate`
+  // without a cast. The ordering is total (position ties are possible, because
+  // nextPosition's max+1 is not atomic) so the head of the queue is the same
+  // item on every tick.
+  const pending: Candidate[] = await db.select({
+    id: items.id,
+    caption: items.caption,
+    kind: items.kind,
+    attempts: items.attempts,
+    position: items.position,
+  }).from(items)
+    .where(and(eq(items.status, 'pending'), isNull(items.postedDate)))
+    .orderBy(asc(items.position), asc(items.createdAt), asc(items.id))
+
+  const decision = selectForSlot(pending, cfg.hashtags)
+  if (decision.action === 'skip') {
+    return decision.reason === 'empty-queue'
+      ? at('empty-queue')
+      : at(decision.reason, decision.itemId)
+  }
+  // selectForSlot returns the id of a row it was handed, so this always finds one.
+  const item = pending.find((p) => p.id === decision.itemId)!
+
+  const imgs: ImageRow[] = await db.select({ id: images.id, url: images.url, hash: images.hash })
+    .from(images)
+    .where(eq(images.itemId, item.id))
+    .orderBy(asc(images.position), asc(images.id))
+
+  const input: PublishInput = {
+    kind: item.kind,
+    imageUrls: imgs.map((i) => i.url),
+    caption: withHashtags(item.caption, cfg.hashtags),
+  }
+
+  // Pre-flight the exact payload BEFORE claiming anything. A shape validate()
+  // rejects — a carousel holding one image, an item with no images at all — is
+  // not made publishable by retrying, so letting it reach the claim would burn
+  // all three attempts and mark the item failed for a reason the owner can fix
+  // in one click.
+  try {
+    validate(input)
+  } catch (e) {
+    console.error('payload rejected before claiming a slot for item', item.id, e)
+    return at('invalid-payload', item.id)
+  }
+
+  // Claim the slot before calling out, and READ BACK what was claimed.
+  //
+  // This is the guard the plan did not have. `UPDATE ... WHERE posted_date IS
+  // NULL` that matches zero rows throws NOTHING: a try/catch around it sees
+  // success, and the run goes on to publish an item another cron tick has
+  // already taken. `.returning()` is what turns a lost race into an observable
+  // event. The unique index protects the SLOT; only this protects the ITEM.
+  let claimed: { id: string }[]
+  try {
+    claimed = await db.update(items)
+      .set({ postedDate: slot.date, slotIndex: slot.index })
+      .where(and(eq(items.id, item.id), isNull(items.postedDate), eq(items.status, 'pending')))
+      .returning({ id: items.id })
+  } catch (e) {
+    // The unique index is the backstop for the other order: our read said the
+    // slot was free, and another run filled it before this statement landed.
+    if (isSlotTaken(e)) return at('race-lost', item.id)
+    console.error('slot claim failed for item', item.id, e)
+    return at('claim-failed', item.id)
+  }
+  if (claimed.length === 0) return at('race-lost', item.id)
+
+  let result: PublishResult
+  try {
+    result = await client.publish(input)
+  } catch (e) {
+    console.error('publish failed for item', item.id, e)
+    try {
+      await recordFailure(db, item, e)
+    } catch (e2) {
+      // The claim survives, so the item is stuck rather than double-posted.
+      console.error('could not record the failure for item', item.id, e2)
+    }
+    return at('error', item.id)
+  }
+
+  // ── The post now EXISTS on Instagram and cannot be recalled. ──────────────
+  // Everything below is recording and cleanup. Nothing here may release the
+  // slot claim, increment `attempts`, or set the item back to `pending`.
+  try {
+    await db.update(items).set({
+      status: 'posted',
+      igMediaId: result.igMediaId,
+      permalink: result.permalink,
+      postedAt: now,
+      error: null,
+    }).where(eq(items.id, item.id))
+  } catch (e) {
+    // Deliberately NOT rolled back. The claim written above already excludes
+    // this item from the pending query and fills the slot, so the next tick
+    // will not publish it again; the row simply lacks its permalink until
+    // someone fixes it by hand.
+    console.error('published but could not record it for item', item.id, e)
+    return at('posted-unrecorded', item.id)
+  }
+
+  await refreshThumbnails(db, imgs)
+  return at('posted', item.id)
+}
+
+/**
+ * Publishes the head of the queue into every slot that is due and unfilled.
+ *
+ * Missed slots do not roll forward — `dueSlots` drops anything older than its
+ * grace window, because catching up would post several times in an hour.
+ */
+export async function runPublish(now: Date): Promise<PublishReport> {
+  const db = getDb()
+  const client = getInstagramClient()
+  const [row] = await db.select().from(settings).where(eq(settings.id, 1))
+  const cfg = resolveSettings(row)
+
+  const slots: SlotResult[] = []
+  for (const slot of dueSlots(now, cfg.slots, cfg.timezone)) {
+    slots.push(await runSlot(db, client, now, slot, cfg))
+  }
+  return { slots, dryRun: client.isDryRun }
+}
