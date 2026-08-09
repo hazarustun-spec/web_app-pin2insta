@@ -298,6 +298,27 @@ describe('graph client container readiness', () => {
     expect(calls.filter((c) => c.includes('media_publish'))).toHaveLength(0)
   })
 
+  // The pre-existing doubles answer every GET with {id}, so they fall straight
+  // through this branch without ever exercising it. Pinned deliberately: an
+  // absent status_code degrades to the pre-poll behaviour, where media_publish
+  // itself rejects an unready container — a clean retry, never a double post.
+  it('publishes without waiting when the body carries no status_code', async () => {
+    const calls: string[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('fields=permalink')) return jsonResponse(200, { permalink: 'https://p/1' })
+      if (url.includes('media_publish')) return jsonResponse(200, { id: 'media-1' })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+
+    // No timer advance at all: a wait here would hang the test rather than pass.
+    const result = await createGraphClient().publish(feed)
+
+    expect(result.igMediaId).toBe('media-1')
+    expect(calls.filter((c) => c.includes('status_code'))).toHaveLength(1)
+  })
+
   it('gives up immediately on a container Meta has already failed', async () => {
     const calls: string[] = []
     global.fetch = vi.fn(async (input: RequestInfo | URL) => {

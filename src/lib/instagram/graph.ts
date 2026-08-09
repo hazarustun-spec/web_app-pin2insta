@@ -38,6 +38,16 @@ async function parseGraphResponse(res: Response) {
   return json ?? {}
 }
 
+/**
+ * No Graph request may hang.
+ *
+ * The publish path makes up to six status polls plus the container, publish and
+ * permalink calls, all inside one cron invocation with a 300s ceiling. A single
+ * socket that accepts and then goes quiet would spend that ceiling and take
+ * every other due slot down with it.
+ */
+const GRAPH_TIMEOUT_MS = 20_000
+
 async function call(path: string, params: Record<string, string>, method: 'GET' | 'POST') {
   const token = process.env.IG_ACCESS_TOKEN!
   // The token travels only in the Authorization header, never in a URL or POST body — a URL is
@@ -46,9 +56,10 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
   const headers = { Authorization: `Bearer ${token}` }
   const url = new URL(`${graphBase()}${path}`)
   const body = new URLSearchParams(params)
+  const signal = AbortSignal.timeout(GRAPH_TIMEOUT_MS)
   const res = method === 'GET'
-    ? await fetch(`${url}?${body}`, { headers })
-    : await fetch(url, { method, headers, body })
+    ? await fetch(`${url}?${body}`, { headers, signal })
+    : await fetch(url, { method, headers, body, signal })
   return parseGraphResponse(res)
 }
 

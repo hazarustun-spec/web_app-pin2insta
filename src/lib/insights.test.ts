@@ -527,6 +527,18 @@ describe('refreshInsights', () => {
     }])
   })
 
+  it('does not count a repair when the lookup comes back empty', async () => {
+    // Writing '' over '' is a no-op the page cannot see, but counting it would
+    // make the cron report repairs it never made.
+    client.permalink.mockResolvedValue('')
+    state.items = [{ ...posted('a'), permalink: '' }]
+
+    const report = await refreshInsights()
+
+    expect(report.repaired).toBe(0)
+    expect(updates).toEqual([])
+  })
+
   it('leaves a permalink alone when the post already has one', async () => {
     state.items = [posted('a')]
     const report = await refreshInsights()

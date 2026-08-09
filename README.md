@@ -25,7 +25,7 @@ npm run dev
 ```
 
 ```bash
-npm test              # 728 tests
+npm test              # 747 tests
 npx tsc --noEmit
 npm run build
 ```
