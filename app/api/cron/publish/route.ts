@@ -71,7 +71,7 @@ export async function POST(req: Request) {
   // Fail closed, and BEFORE looking at the request, so an unconfigured
   // deployment answers identically no matter what was sent.
   if (!secret || !ASCII_SECRET.test(secret)) {
-    if (secret) console.error('CRON_SECRET must be printable ASCII; the cron route is disabled')
+    if (secret) console.error('CRON_SECRET must be printable ASCII with no leading or trailing space; the cron route is disabled')
     return NextResponse.json({ error: 'not configured' }, { status: 503, headers: noStore })
   }
   if (!authorised(req.headers.get('authorization'), secret)) {

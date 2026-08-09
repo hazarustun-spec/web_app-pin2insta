@@ -186,6 +186,24 @@ describe('graph client publish irreversibility', () => {
     },
   )
 
+  // parseGraphResponse returns `json ?? {}` on a 200, so a well-formed but
+  // empty body must not put `undefined` into the column.
+  it('returns an empty permalink when the lookup succeeds with no permalink field', async () => {
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('fields=permalink')) return jsonResponse(200, {})
+      if (url.includes('media_publish')) return jsonResponse(200, { id: 'media-1' })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+
+    const result = await createGraphClient().publish({
+      kind: 'feed',
+      imageUrls: ['https://example.com/a.jpg'],
+      caption: 'hello',
+    })
+    expect(result).toEqual({ igMediaId: 'media-1', permalink: '' })
+  })
+
   it('still returns the permalink when the lookup succeeds', async () => {
     global.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
