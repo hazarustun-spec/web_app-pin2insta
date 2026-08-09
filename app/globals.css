@@ -12,15 +12,111 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
+/*
+ * No dark-mode block. The design spec pins this tool to a white page with thin
+ * grey rules and black type — "no colour except error states" — and the
+ * scaffold's prefers-color-scheme override painted a near-black body behind
+ * cards that are explicitly white.
+ */
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/* ---------------------------------------------------------------------------
+ * The caption save animation.
+ *
+ * Timings are from the design spec and are not decorative: border grey→black
+ * over 120ms, a hairline sweeping left to right over 220ms, the checkmark in
+ * over 180ms, held 900ms, faded over 200ms, and the border back to grey over
+ * 400ms.
+ *
+ * Both overlays are absolutely positioned. Nothing here may change the size of
+ * anything, because a run of thirty captions leaves several of these playing at
+ * once and a card that grows by a line would move every card after it.
+ * ------------------------------------------------------------------------- */
+
+@keyframes p2i-sweep {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+@keyframes p2i-check-in {
+  from { opacity: 0; transform: translateY(2px) scale(0.85); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes p2i-check-out {
+  to { opacity: 0; }
+}
+
+.p2i-field {
+  border-bottom: 1px solid rgb(212 212 212);
+  transition: border-color 400ms ease-out;
+}
+
+/* Mid-grey, deliberately not black: black is what the save animation means,
+ * and a focused field that is already black would swallow the whole effect. */
+.p2i-field:focus {
+  border-color: rgb(163 163 163);
+}
+
+.p2i-field[data-saving='true'] {
+  border-color: rgb(23 23 23);
+  transition-duration: 120ms;
+}
+
+.p2i-sweep {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: rgb(23 23 23);
+  transform-origin: left;
+  animation: p2i-sweep 220ms ease-out both;
+}
+
+.p2i-check {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  font-size: 11px;
+  line-height: 1;
+  color: rgb(23 23 23);
+  pointer-events: none;
+  animation:
+    p2i-check-in 180ms ease-out both,
+    p2i-check-out 200ms ease-in 900ms both;
+}
+
+.p2i-error-rule {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: rgb(220 38 38);
+}
+
+/* "Only the checkmark fade plays": the sweep is gone, the checkmark arrives
+ * without movement or scaling, and the border changes colour without a
+ * transition. The 900ms hold and the 200ms fade are kept, because the fade is
+ * the part the spec asks to keep. */
+@media (prefers-reduced-motion: reduce) {
+  .p2i-field { transition: none; }
+  .p2i-sweep { display: none; }
+  .p2i-check {
+    animation:
+      p2i-check-in 1ms linear both,
+      p2i-check-out 200ms ease-in 900ms both;
+  }
+}
+
+/* The drop target during a card drag. box-shadow, never border or outline
+ * offset — a border would resize the card and shove the grid sideways mid-drag. */
+.p2i-drop-target {
+  box-shadow: -2px 0 0 0 rgb(23 23 23);
 }
