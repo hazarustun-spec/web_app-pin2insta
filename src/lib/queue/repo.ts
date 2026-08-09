@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { eq, ne, sql, inArray, asc } from 'drizzle-orm'
+import { eq, ne, and, sql, inArray, asc } from 'drizzle-orm'
+import type { BatchItem } from 'drizzle-orm/batch'
 import { getDb } from '@/src/db'
 import { items, images } from '@/src/db/schema'
 import { sha256, cropTo45, ImageValidationError } from '@/src/lib/images/process'
@@ -212,3 +213,230 @@ export async function listQueue() {
 }
 
 export type QueueItem = Awaited<ReturnType<typeof listQueue>>[number]
+
+// ---------------------------------------------------------------------------
+// Queue mutations: caption, kind, order, grouping, deletion.
+// ---------------------------------------------------------------------------
+
+/**
+ * Thrown for a mutation the owner asked for and cannot have — a caption that is
+ * too long, a shape Instagram would refuse, a stale reorder. Same contract as
+ * IngestError: its message is written for a human and is the ONLY thing a route
+ * may echo back verbatim. Every other failure is logged and masked.
+ */
+export class QueueError extends Error {}
+
+/**
+ * neon-http has no transaction support — db.transaction() throws — so every
+ * multi-statement mutation goes through db.batch(), which sends the lot in one
+ * atomic round-trip. Its signature demands a non-empty tuple, which a mapped
+ * array cannot prove it is; this is the cast that bridges that.
+ */
+type BatchStatements = [BatchItem<'pg'>, ...BatchItem<'pg'>[]]
+
+export const KINDS = ['feed', 'carousel', 'story'] as const
+export type ItemKind = (typeof KINDS)[number]
+
+export function isItemKind(v: unknown): v is ItemKind {
+  return typeof v === 'string' && (KINDS as readonly string[]).includes(v)
+}
+
+/** Instagram's caption ceiling, enforced here so a too-long caption fails where the owner sees it instead of at 14:00 in a cron run. Counted in UTF-16 code units, exactly as `validate()` counts it. */
+export const MAX_CAPTION_CHARS = 2200
+
+const MIN_CAROUSEL = 2
+const MAX_CAROUSEL = 10
+
+export function reindex(ids: string[]) {
+  return ids.map((id, i) => ({ id, position: i + 1 }))
+}
+
+/**
+ * Renumbers the queue to the given order.
+ *
+ * DECISIONS:
+ * - `ids` must be the WHOLE queue (every non-posted item, exactly once).
+ *   reindex hands out 1..n densely, so renumbering 3 of 10 items would collide
+ *   with the positions of the other 7. A short, long, or duplicated list is a
+ *   stale client and is refused outright.
+ * - An id that is not in the queue is REJECTED, not ignored: applying the
+ *   surviving order silently would leave the owner's screen disagreeing with
+ *   the database.
+ * - Posted items are excluded from the comparison because listQueue hides them,
+ *   so the client could not have sent them.
+ * - The writes go out as one db.batch(): a partially applied reorder leaves the
+ *   queue in an order nobody asked for.
+ */
+export async function applyOrder(ids: string[]) {
+  if (new Set(ids).size !== ids.length) {
+    throw new QueueError('sıralamada aynı öğe birden fazla kez var')
+  }
+  const db = getDb()
+  const rows = await db.select({ id: items.id }).from(items).where(ne(items.status, 'posted'))
+  const known = new Set(rows.map((r) => r.id))
+  if (rows.length !== ids.length || ids.some((id) => !known.has(id))) {
+    throw new QueueError('sıralama kuyrukla eşleşmiyor — sayfayı yenileyip tekrar deneyin')
+  }
+  const ordered = reindex(ids)
+  // drizzle's batch() takes a non-empty tuple; an empty queue has nothing to do.
+  if (ordered.length === 0) return
+  await db.batch(
+    ordered.map(({ id, position }) =>
+      db.update(items).set({ position }).where(eq(items.id, id)),
+    ) as unknown as BatchStatements,
+  )
+}
+
+/** An empty caption is fine — an item may be captioned later, and the publisher already refuses to post an empty-caption non-story. */
+export async function setCaption(id: string, caption: string) {
+  if (caption.length > MAX_CAPTION_CHARS) {
+    throw new QueueError(`açıklama çok uzun — en fazla ${MAX_CAPTION_CHARS} karakter olabilir`)
+  }
+  const updated = await getDb()
+    .update(items)
+    .set({ caption })
+    .where(eq(items.id, id))
+    .returning({ id: items.id })
+  if (updated.length === 0) throw new QueueError('öğe bulunamadı')
+}
+
+/**
+ * Why `kind` cannot hold `imageCount` images, in Turkish, or null when the pair
+ * is one `validate()` (src/lib/instagram/types.ts) accepts.
+ *
+ * This is the whole point of validating kind changes here: an item whose kind
+ * and image count disagree can never publish, and the failure would surface in
+ * a cron run rather than in front of the owner.
+ */
+export function kindShapeError(kind: ItemKind, imageCount: number): string | null {
+  if (kind === 'carousel') {
+    return imageCount >= MIN_CAROUSEL && imageCount <= MAX_CAROUSEL
+      ? null
+      : 'karusel 2 ile 10 görsel içermelidir — görselleri gruplayın'
+  }
+  return imageCount === 1
+    ? null
+    : 'akış veya hikaye tam olarak bir görsel alır — önce grubu çözün'
+}
+
+/**
+ * DECISIONS:
+ * - A single-image item cannot become `carousel`. Grouping is the only way in,
+ *   because `validate()` demands 2-10 images for a carousel.
+ * - A multi-image item cannot become `feed`/`story` either: it is REJECTED
+ *   rather than silently ungrouped, because ungrouping would have to either
+ *   discard the extra images or invent new queue items, and destroying the
+ *   owner's uploads on a dropdown change is worse than an error message.
+ */
+export async function setKind(id: string, kind: ItemKind) {
+  // Defence in depth: the route validates the shape too, but nothing else stops
+  // an arbitrary string reaching the kind column from a future caller.
+  if (!isItemKind(kind)) throw new QueueError('geçersiz gönderi türü')
+  const db = getDb()
+  const [row] = await db.select({ id: items.id }).from(items).where(eq(items.id, id))
+  if (!row) throw new QueueError('öğe bulunamadı')
+  const imgs = await db.select({ id: images.id }).from(images).where(eq(images.itemId, id))
+  const problem = kindShapeError(kind, imgs.length)
+  if (problem) throw new QueueError(problem)
+  await db.update(items).set({ kind }).where(eq(items.id, id))
+}
+
+/**
+ * DECISIONS:
+ * - A `posted` item is never deleted. `images.itemId` cascades, so removing the
+ *   row destroys the SHA-256 hash that stops the same picture being republished
+ *   later — duplicate detection would silently stop protecting exactly the case
+ *   it exists for. The status is re-checked inside the DELETE predicate as well
+ *   as before it, so a cron run that posts the item mid-request cannot slip
+ *   through the gap between the two.
+ * - ORDER: the row goes first, the blobs second. A failed blob delete then
+ *   leaves an orphaned object — wasted storage, invisible to the owner. The
+ *   reverse order would leave a queue item pointing at deleted images, which
+ *   looks fine on screen and fails at publish time. Blob failures are logged,
+ *   never surfaced, and never undo the delete the owner asked for.
+ */
+export async function deleteItem(id: string) {
+  const db = getDb()
+  const [row] = await db.select({ status: items.status }).from(items).where(eq(items.id, id))
+  if (!row) throw new QueueError('öğe bulunamadı')
+  if (row.status === 'posted') throw new QueueError('paylaşılmış gönderi silinemez')
+
+  const imgs = await db.select({ url: images.url }).from(images).where(eq(images.itemId, id))
+
+  const deleted = await db
+    .delete(items)
+    .where(and(eq(items.id, id), ne(items.status, 'posted')))
+    .returning({ id: items.id })
+  if (deleted.length === 0) throw new QueueError('paylaşılmış gönderi silinemez')
+
+  await Promise.all(
+    imgs.map((i) => deleteImage(i.url).catch((e) => console.error('blob cleanup failed:', e))),
+  )
+}
+
+/**
+ * Flattens the images of `ids` into carousel order: the order the owner listed
+ * the items in, then each item's own image position, then id as a tiebreak.
+ *
+ * The database returns rows in whatever order it likes, so relying on the query
+ * order would scramble a carousel the owner arranged deliberately.
+ */
+export function orderCarouselImages<T extends { id: string; itemId: string; position: number }>(
+  ids: string[],
+  imgs: T[],
+): T[] {
+  const byItem = new Map<string, T[]>()
+  for (const img of imgs) {
+    const bucket = byItem.get(img.itemId)
+    if (bucket) bucket.push(img)
+    else byItem.set(img.itemId, [img])
+  }
+  return ids.flatMap((id) =>
+    // Sorts a bucket we built ourselves, so `imgs` is left untouched.
+    (byItem.get(id) ?? []).sort(
+      (a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    ),
+  )
+}
+
+/**
+ * Folds 2-10 pending items into a single carousel. The first id survives and
+ * absorbs the others' images; the rest are removed without touching their blobs.
+ *
+ * The 2-10 ceiling that actually matters is on IMAGES, not items — an item can
+ * already hold more than one image, and `validate()` counts images.
+ */
+export async function groupIntoCarousel(ids: string[]) {
+  if (ids.length < MIN_CAROUSEL || ids.length > MAX_CAROUSEL) {
+    throw new QueueError('karusel için 2 ile 10 arasında öğe seçin')
+  }
+  if (new Set(ids).size !== ids.length) throw new QueueError('aynı öğe birden fazla kez seçilemez')
+
+  const db = getDb()
+  const rows = await db.select().from(items).where(inArray(items.id, ids))
+  // inArray silently returns fewer rows than ids given, so a typo would group
+  // whatever happened to match and quietly drop the rest.
+  if (rows.length !== ids.length) throw new QueueError('seçilen öğelerden bazıları bulunamadı')
+  if (rows.some((r) => r.status !== 'pending')) {
+    throw new QueueError('yalnızca bekleyen öğeler gruplanabilir')
+  }
+  if (rows.some((r) => r.kind === 'carousel')) throw new QueueError('karusel içine karusel eklenemez')
+
+  const imgs = await db.select().from(images).where(inArray(images.itemId, ids))
+  const ordered = orderCarouselImages(ids, imgs)
+  if (ordered.length < MIN_CAROUSEL || ordered.length > MAX_CAROUSEL) {
+    throw new QueueError('karusel 2 ile 10 görsel içermelidir')
+  }
+
+  const [head, ...rest] = ids
+  // One atomic batch, in this order: the images are reassigned to the head
+  // BEFORE the source rows go, or onDelete: 'cascade' takes them with it.
+  // `rest` already excludes the head, so the delete needs no further predicate.
+  await db.batch([
+    db.update(items).set({ kind: 'carousel' }).where(eq(items.id, head)),
+    ...ordered.map((img, i) =>
+      db.update(images).set({ itemId: head, position: i }).where(eq(images.id, img.id)),
+    ),
+    db.delete(items).where(inArray(items.id, rest)),
+  ] as unknown as BatchStatements)
+}
