@@ -196,14 +196,18 @@ describe('cropTo45', () => {
     }).png({ compressionLevel: 9 }).toBuffer()
     expect(bomb.byteLength).toBeLessThan(25 * 1024 * 1024) // passes the route's byte cap
     await expect(cropTo45(bomb)).rejects.toThrow('görsel çok büyük — en fazla 64 megapiksel olmalı')
-  })
+    // Explicit timeout: encoding a 160MP PNG and rejecting it genuinely takes
+    // seconds, which sits close enough to the 5s default to fail whenever the
+    // suite shares a machine with a build.
+  }, 30_000)
 
   it('accepts an image just under the pixel ceiling', async () => {
     const big = await sharp({
       create: { width: 8000, height: 7999, channels: 3, background: { r: 1, g: 1, b: 1 } },
     }).png({ compressionLevel: 9 }).toBuffer()
     await expect(cropTo45(big)).resolves.toBeInstanceOf(Buffer)
-  })
+    // Same reason: 64 megapixels really is slow to encode and decode.
+  }, 30_000)
 
   // A libvips decode failure is raw internal text on an attacker-controlled
   // path. It must NOT be an ImageValidationError, or the route relabels it as

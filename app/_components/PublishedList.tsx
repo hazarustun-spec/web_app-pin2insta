@@ -31,25 +31,41 @@ function Meta({ children }: { children: React.ReactNode }) {
   return <p className="text-[11px] text-neutral-500">{children}</p>
 }
 
-/** One post's numbers, or the reason there are none. */
+/**
+ * One post's numbers, or the reason there are none.
+ *
+ * A switch with an exhaustiveness check rather than an if-chain: a chain ends
+ * in an unguarded return, so the next state added to `metricState` would fall
+ * into the missing-id sentence and accuse a perfectly good row of having lost
+ * its Instagram id. That is exactly the bug stories hit, in general form —
+ * here it is a compile error instead.
+ */
 function Metrics({ post }: { post: PublishedPost }) {
   const state = metricState(post)
-  if (state === 'measured' && post.metric) {
-    return (
-      <Meta>
-        {post.metric.likes} beğeni · {post.metric.comments} yorum · {post.metric.saved} kaydetme ·{' '}
-        {post.metric.reach} erişim
-      </Meta>
-    )
+  switch (state) {
+    case 'measured':
+      return post.metric ? (
+        <Meta>
+          {post.metric.likes} beğeni · {post.metric.comments} yorum · {post.metric.saved} kaydetme ·{' '}
+          {post.metric.reach} erişim
+        </Meta>
+      ) : null
+    case 'pending':
+      return <Meta>ölçüm bekleniyor</Meta>
+    // Not a fault and not a wait. Named precisely: Instagram does publish story
+    // insights (reach, replies, exits), just not these three, and claiming it
+    // measures nothing would be saying something untrue about Instagram.
+    case 'story':
+      return <Meta>hikâyelerde beğeni, yorum ve kaydetme sayısı yok</Meta>
+    // media_publish answered 200 without an id, so nothing can ever be fetched
+    // for this row. Saying "bekleniyor" here would be a wait with no end.
+    case 'unmeasurable':
+      return <Meta>Instagram kimliği kaydedilmedi — bu gönderinin ölçümü alınamıyor</Meta>
+    default: {
+      const exhaustive: never = state
+      return exhaustive
+    }
   }
-  if (state === 'pending') return <Meta>ölçüm bekleniyor</Meta>
-  // Not a fault, and not a wait: Instagram publishes no interaction metrics for
-  // a story at all, so this row is finished and its absence of numbers says
-  // nothing about how it did.
-  if (state === 'story') return <Meta>hikâyeler için Instagram etkileşim ölçümü vermiyor</Meta>
-  // media_publish answered 200 without an id, so nothing can ever be fetched
-  // for this row. Saying "bekleniyor" here would be a wait with no end.
-  return <Meta>Instagram kimliği kaydedilmedi — bu gönderinin ölçümü alınamıyor</Meta>
 }
 
 function SlotSummary({ stats }: { stats: SlotStat[] }) {
