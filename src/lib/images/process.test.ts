@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import sharp from 'sharp'
-import { sha256, cropTo45, makeThumb } from './process'
+import { sha256, cropTo45, makeThumb, ImageValidationError } from './process'
 
 async function solid(width: number, height: number) {
   return sharp({
@@ -148,6 +148,52 @@ describe('cropTo45', () => {
 
     const { width: w2, height: h2 } = await sharp(await cropTo45(await solid(5000, 320))).metadata()
     expect(w2! / h2!).toBe(0.8)
+  })
+
+  // The route's Content-Type allowlist is client-supplied and proves nothing
+  // about the bytes. These pin the checks that actually inspect the container.
+  it('rejects an SVG even though sharp can render one', async () => {
+    const svg = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000"><rect width="1000" height="1000" fill="#ccc"/></svg>',
+    )
+    // Guard against a vacuous test: sharp must actually be willing to render it.
+    await expect(sharp(svg).jpeg().toBuffer()).resolves.toBeInstanceOf(Buffer)
+    await expect(cropTo45(svg)).rejects.toThrow(ImageValidationError)
+    await expect(cropTo45(svg)).rejects.toThrow('desteklenmeyen görsel biçimi')
+  })
+
+  it('rejects a decompression bomb whose byte size is small', async () => {
+    // ~40000x4000 = 160MP, over the 64MP ceiling, but only a few MB on the wire
+    // because it is a single flat colour.
+    const bomb = await sharp({
+      create: { width: 40000, height: 4000, channels: 3, background: { r: 1, g: 1, b: 1 } },
+    }).png({ compressionLevel: 9 }).toBuffer()
+    expect(bomb.byteLength).toBeLessThan(25 * 1024 * 1024) // passes the route's byte cap
+    await expect(cropTo45(bomb)).rejects.toThrow('görsel çok büyük — en fazla 64 megapiksel olmalı')
+  })
+
+  it('accepts an image just under the pixel ceiling', async () => {
+    const big = await sharp({
+      create: { width: 8000, height: 7999, channels: 3, background: { r: 1, g: 1, b: 1 } },
+    }).png({ compressionLevel: 9 }).toBuffer()
+    await expect(cropTo45(big)).resolves.toBeInstanceOf(Buffer)
+  })
+
+  // A libvips decode failure is raw internal text on an attacker-controlled
+  // path. It must NOT be an ImageValidationError, or the route relabels it as
+  // user-facing and echoes it back verbatim.
+  it('throws a non-ImageValidationError for a truncated JPEG', async () => {
+    // Header intact, pixel data cut off: metadata() succeeds, toBuffer() fails
+    // deep inside libvips with text like "VipsJpeg: Premature end of input
+    // file /var/task/node_modules/...".
+    const truncated = (await solid(1000, 1000)).subarray(0, 400)
+    await expect(cropTo45(truncated)).rejects.toThrow()
+    await expect(cropTo45(truncated)).rejects.not.toBeInstanceOf(ImageValidationError)
+  })
+
+  it('does not leak libvips text when the header itself is unparseable', async () => {
+    const garbage = Buffer.from('not an image at all, just ascii')
+    await expect(cropTo45(garbage)).rejects.toThrow('görsel okunamadı')
   })
 })
 

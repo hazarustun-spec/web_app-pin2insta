@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { eq, ne, sql, inArray, asc } from 'drizzle-orm'
 import { getDb } from '@/src/db'
 import { items, images } from '@/src/db/schema'
-import { sha256, cropTo45 } from '@/src/lib/images/process'
+import { sha256, cropTo45, ImageValidationError } from '@/src/lib/images/process'
 import { uploadImage } from '@/src/lib/images/storage'
 
 export type IngestDecision = { status: 'added' } | { status: 'duplicate' }
@@ -12,6 +12,18 @@ export class IngestError extends Error {}
 
 export function decideIngest(hash: string, knownHashes: Set<string>): IngestDecision {
   return knownHashes.has(hash) ? { status: 'duplicate' } : { status: 'added' }
+}
+
+/**
+ * Decides whether a failure from the image layer is safe to show the owner.
+ * The route prints an IngestError's message verbatim and masks everything else,
+ * so this function alone determines what an uploader can make the server echo
+ * back. ONLY ImageValidationError carries a message written for a human;
+ * libvips decode failures ("VipsJpeg: Premature end of input file
+ * /var/task/...") reach here too and must pass through untouched.
+ */
+export function toIngestFailure(e: unknown): unknown {
+  return e instanceof ImageValidationError ? new IngestError(e.message) : e
 }
 
 export async function nextPosition(): Promise<number> {
@@ -34,9 +46,7 @@ export async function ingestBuffer(buf: Buffer, name: string) {
   try {
     cropped = await cropTo45(buf)
   } catch (e) {
-    // cropTo45's thrown messages are the two deliberate, user-facing Turkish
-    // validation strings — safe to surface verbatim.
-    throw new IngestError((e as Error).message)
+    throw toIngestFailure(e)
   }
   const hash = sha256(cropped)
 
