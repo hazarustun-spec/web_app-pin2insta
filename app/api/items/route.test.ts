@@ -10,6 +10,7 @@ vi.mock('@/src/lib/queue/repo', async (importOriginal) => ({
 }))
 
 const { POST } = await import('./route')
+const { IngestError } = await import('@/src/lib/queue/repo')
 
 function jpeg(bytes: number, name = 'a.jpg', type = 'image/jpeg') {
   return new File([new Uint8Array(bytes)], name, { type })
@@ -82,6 +83,16 @@ describe('POST /api/items validation', () => {
     expect(body.results[0].message).toContain('dosya çok büyük')
     // file.size is checked before file.arrayBuffer(), so nothing was decoded.
     expect(ingestBuffer).not.toHaveBeenCalled()
+  })
+
+  it('shows a deliberate validation message from the multipart path too', async () => {
+    ingestBuffer.mockRejectedValue(new IngestError('görsel çok küçük — en az 320px olmalı'))
+    const res = await POST(req([jpeg(10, 'small.jpg')]))
+    const body = await res.json()
+    expect(body.results[0]).toMatchObject({
+      status: 'error',
+      message: 'görsel çok küçük — en az 320px olmalı',
+    })
   })
 
   it('lets one bad file fail without aborting its batch-mates', async () => {
@@ -180,6 +191,22 @@ describe('POST /api/items staged uploads', () => {
   it('reports an empty upload list as a bad request', async () => {
     const res = await POST(jsonReq({ uploads: [] }))
     expect(res.status).toBe(400)
+  })
+
+  // The positive half of the IngestError contract: repo.test.ts proves
+  // toIngestFailure builds the right error and the tests above prove an
+  // unknown error is masked, but nothing asserted that a deliberate message
+  // actually reaches the client. Without this, deleting the `instanceof
+  // IngestError` branch replaces every user-facing Turkish string with
+  // 'yüklenemedi' and the whole suite stays green.
+  it('shows a deliberate validation message to the owner', async () => {
+    ingestFromUrl.mockRejectedValue(new IngestError('geçersiz yükleme adresi'))
+    const res = await POST(jsonReq({ uploads: [{ url: staged(1), name: 'a.jpg' }] }))
+    const body = await res.json()
+    expect(body.results[0]).toMatchObject({
+      status: 'error',
+      message: 'geçersiz yükleme adresi',
+    })
   })
 
   it('lets one staged failure stand alone in its batch', async () => {

@@ -52,7 +52,9 @@ const STAGED_FETCH_TIMEOUT_MS = 30_000
  */
 export function stagedBlobHost(): string | null {
   const storeId = process.env.BLOB_READ_WRITE_TOKEN?.split('_')[3]
-  return storeId ? `${storeId}.public.blob.vercel-storage.com` : null
+  // URL.hostname is always lowercased, so an uppercase store id would produce a
+  // host that could never compare equal.
+  return storeId ? `${storeId.toLowerCase()}.public.blob.vercel-storage.com` : null
 }
 
 /**

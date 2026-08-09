@@ -93,6 +93,8 @@ describe('isStagedBlobUrl', () => {
     ['leading-dot host', 'https://.public.blob.vercel-storage.com/tmp/a.jpg'],
     ['userinfo trick', `https://${HOST}@evil.com/tmp/a.jpg`],
     ['credentials on the real host', `https://user:pw@${HOST}/tmp/a.jpg`],
+    ['a username only', `https://user@${HOST}/tmp/a.jpg`],
+    ['a password only', `https://:pw@${HOST}/tmp/a.jpg`],
     ['explicit port', `https://${HOST}:22/tmp/a.jpg`],
     ['outside tmp/', `https://${HOST}/queue/a.jpg`],
     ['tmp without slash', `https://${HOST}/tmpfoo/a.jpg`],
@@ -123,8 +125,19 @@ describe('stagedBlobHost', () => {
   })
 
   it('derives the store host from the read-write token', () => {
+    process.env.BLOB_READ_WRITE_TOKEN = 'vercel_blob_rw_storeid123_secretpart'
+    expect(stagedBlobHost()).toBe('storeid123.public.blob.vercel-storage.com')
+  })
+
+  // URL.hostname is always lowercased, so an uppercase store id would derive a
+  // host that could never compare equal to a parsed one.
+  it('lowercases the store id so it can match a parsed hostname', () => {
     process.env.BLOB_READ_WRITE_TOKEN = 'vercel_blob_rw_STOREID123_secretpart'
-    expect(stagedBlobHost()).toBe('STOREID123.public.blob.vercel-storage.com')
+    const host = stagedBlobHost()
+    expect(host).toBe('storeid123.public.blob.vercel-storage.com')
+    expect(isStagedBlobUrl(`https://STOREID123.public.blob.vercel-storage.com/tmp/a.jpg`, host)).toBe(
+      true,
+    )
   })
 
   it('returns null when the token is unset, so the guard fails closed', () => {

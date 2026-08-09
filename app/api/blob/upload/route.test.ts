@@ -8,6 +8,7 @@ vi.mock('next/headers', () => ({
 
 const { POST } = await import('./route')
 const { signSession } = await import('@/src/lib/auth')
+const { isStagedBlobUrl } = await import('@/src/lib/queue/repo')
 
 // Throwaway values. The real ones live in .env.local and are never read here.
 const ENV = {
@@ -62,9 +63,29 @@ describe('POST /api/blob/upload', () => {
     ['an empty pathname', ''],
     ['a nested path under tmp', 'tmp/sub/a.jpg'],
     ['a name with a slash escape', 'tmp/..%2fqueue/a.jpg'],
+    // tmp/ appears but not at the start — the cases that survive an unanchored
+    // pattern, which is D4's bug wearing a different hat.
+    ['tmp nested under the queue namespace', 'queue/tmp/a.jpg'],
+    ['tmp buried under two levels', 'x/y/tmp/deadbeef.jpg'],
+    // addRandomSuffix lengthens the stored pathname by ~31 characters, so a
+    // name accepted at the ingest guard's full 200 would stage to a URL that
+    // guard then rejects — an object nothing can ever fetch or delete.
+    ['a name too long to survive the random suffix', `tmp/${'a'.repeat(161)}.jpg`],
   ])('refuses to mint a token for %s', async (_label, pathname) => {
     const res = await POST(tokenRequest(pathname))
     expect(res.status).toBe(400)
+  })
+
+  // Pins the round trip the two regexes exist to guarantee: anything the token
+  // permits must still be fetchable by the ingest guard after the suffix lands.
+  it('only permits names that survive the suffix and satisfy the ingest guard', async () => {
+    const longest = 'a'.repeat(156) + '.jpg' // 160 chars after tmp/
+    const res = await POST(tokenRequest(`tmp/${longest}`))
+    expect(res.status).toBe(200)
+
+    const host = 'teststore.public.blob.vercel-storage.com'
+    const suffixed = `${longest.replace(/\.jpg$/, '')}-${'x'.repeat(30)}.jpg`
+    expect(isStagedBlobUrl(`https://${host}/tmp/${suffixed}`, host)).toBe(true)
   })
 
   it('rejects an unauthenticated request before minting anything', async () => {

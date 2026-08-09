@@ -64,7 +64,10 @@ describe('ingestFromUrl', () => {
     uploadImage.mockResolvedValue({ url: `https://${HOST}/queue/h.jpg`, pathname: 'queue/h.jpg' })
     deleteImage.mockResolvedValue(undefined)
     batch.mockResolvedValue([])
-    fetchSpy = vi.spyOn(globalThis, 'fetch')
+    // Fail closed on the network: without a default implementation the spy is a
+    // passthrough, so a regressed SSRF guard would make these tests issue real
+    // outbound requests before failing.
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('unexpected fetch'))
   })
 
   afterEach(() => {
@@ -78,6 +81,18 @@ describe('ingestFromUrl', () => {
     const res = await ingestFromUrl(STAGED, 'a.jpg')
     expect(res).toMatchObject({ status: 'added', name: 'a.jpg' })
     expect(deleteImage).toHaveBeenCalledWith(STAGED)
+  })
+
+  // The capped read must deliver the whole body, in order. Asserting only that
+  // it rejects an oversized stream leaves a regression that hands cropTo45
+  // zero bytes, or only the final chunk, entirely unguarded.
+  it('hands the decoder every chunk, concatenated in order', async () => {
+    const enc = new TextEncoder()
+    fetchSpy.mockResolvedValue(
+      streamed([enc.encode('AAA'), enc.encode('BBB'), enc.encode('CCC')]),
+    )
+    await ingestFromUrl(STAGED, 'a.jpg')
+    expect((cropTo45.mock.calls[0][0] as Buffer).toString()).toBe('AAABBBCCC')
   })
 
   it('refuses a URL outside our own staging area without fetching it', async () => {

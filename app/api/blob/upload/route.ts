@@ -28,9 +28,14 @@ const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
  * it is the one field that decides where the write lands. Unvalidated, a client
  * can stage into `queue/` — a namespace ingestFromUrl refuses to touch, so the
  * object would never be fetched, never be deleted, and bill forever.
- * Must stay in step with STAGED_PATH in src/lib/queue/repo.ts.
+ * Must stay in step with STAGED_PATH in src/lib/queue/repo.ts, which allows 200
+ * characters after `tmp/`. The budget here is lower on purpose:
+ * `addRandomSuffix: true` makes the Blob API lengthen the stored pathname by
+ * roughly 31 characters, so a name accepted here at the full 200 would produce
+ * a URL the ingest guard rejects — leaving an object that is never fetched and
+ * never deleted, because cleanup runs only after the guard passes.
  */
-const STAGING_PATH = /^tmp\/[A-Za-z0-9._-]{1,200}$/
+const STAGING_PATH = /^tmp\/[A-Za-z0-9._-]{1,160}$/
 
 export async function POST(req: Request): Promise<NextResponse> {
   // proxy.ts already guards this path, but a token minted here can write to the
