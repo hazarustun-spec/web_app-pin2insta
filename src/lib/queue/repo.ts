@@ -3,7 +3,7 @@ import { eq, ne, sql, inArray, asc } from 'drizzle-orm'
 import { getDb } from '@/src/db'
 import { items, images } from '@/src/db/schema'
 import { sha256, cropTo45, ImageValidationError } from '@/src/lib/images/process'
-import { uploadImage } from '@/src/lib/images/storage'
+import { uploadImage, deleteImage } from '@/src/lib/images/storage'
 
 export type IngestDecision = { status: 'added' } | { status: 'duplicate' }
 
@@ -37,6 +37,64 @@ export async function nextPosition(): Promise<number> {
 function isDuplicateHashViolation(e: unknown): boolean {
   const err = e as { code?: string; constraint?: string } | null
   return err?.code === '23505' && err?.constraint === 'images_hash_unique_idx'
+}
+
+/** Hostname suffix of every Vercel Blob public store. */
+const BLOB_HOST_SUFFIX = '.public.blob.vercel-storage.com'
+/** Mirrors the token route's maximumSizeInBytes — nothing larger can have been staged. */
+const MAX_STAGED_BYTES = 25 * 1024 * 1024
+
+/**
+ * True only for a URL that our own client-upload route could have produced.
+ *
+ * ingestFromUrl makes the server fetch a URL the client chose. Without this the
+ * route is a server-side request forgery primitive: an internal address, a
+ * cloud metadata endpoint, or a file on the deploy host, fetched with the
+ * server's network position and reported back through the ingest result.
+ */
+export function isStagedBlobUrl(raw: string): boolean {
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    return false
+  }
+  if (u.protocol !== 'https:') return false
+  if (!u.hostname.endsWith(BLOB_HOST_SUFFIX)) return false
+  // Reject a hostname that is only the suffix, so a registered
+  // "public.blob.vercel-storage.com" style host cannot match.
+  if (u.hostname.length <= BLOB_HOST_SUFFIX.length) return false
+  return u.pathname.startsWith('/tmp/')
+}
+
+/**
+ * Ingest an image the browser uploaded straight to Blob storage, then delete
+ * the staged copy. Used for drops too large to survive the 4.5MB function
+ * request-body cap — which is any drop of more than about one photo.
+ */
+export async function ingestFromUrl(url: string, name: string) {
+  if (!isStagedBlobUrl(url)) throw new IngestError('geçersiz yükleme adresi')
+
+  const res = await fetch(url)
+  if (!res.ok) throw new IngestError('yüklenen görsel bulunamadı')
+
+  const declared = Number(res.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > MAX_STAGED_BYTES) {
+    throw new IngestError('dosya çok büyük — en fazla 25MB olmalı')
+  }
+  const buf = Buffer.from(await res.arrayBuffer())
+  // Content-Length is advisory; the delivered body is what costs memory.
+  if (buf.byteLength > MAX_STAGED_BYTES) {
+    throw new IngestError('dosya çok büyük — en fazla 25MB olmalı')
+  }
+
+  try {
+    return await ingestBuffer(buf, name)
+  } finally {
+    // Best-effort: a surviving tmp/ object is wasted storage, not a correctness
+    // problem, and must never mask the ingest result.
+    await deleteImage(url).catch((e) => console.error('staged blob cleanup failed:', e))
+  }
 }
 
 export async function ingestBuffer(buf: Buffer, name: string) {

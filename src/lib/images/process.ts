@@ -18,8 +18,22 @@ const MAX_PIXELS = 64_000_000
  * checked against the bytes, so this — not the route's Content-Type allowlist —
  * is what actually keeps SVG away from librsvg (SVGs can embed scripts and
  * external references).
+ *
+ * AVIF is absent on purpose: sharp reports it as `heif`, never `avif`, so
+ * listing 'avif' here would reject every AVIF while matching nothing. It is
+ * accepted via the heif/av1 pair below.
  */
-const ALLOWED_FORMATS = new Set(['jpeg', 'png', 'webp', 'avif'])
+const ALLOWED_FORMATS = new Set(['jpeg', 'png', 'webp'])
+
+/**
+ * `heif` covers both AVIF and HEIC. Instagram takes neither directly, but we
+ * re-encode to JPEG anyway, and AVIF is what browsers hand you on "Copy image"
+ * — so accept AVIF and exclude HEIC by discriminating on the codec.
+ */
+function isAcceptedFormat(probe: { format?: string; compression?: string }): boolean {
+  if (probe.format && ALLOWED_FORMATS.has(probe.format)) return true
+  return probe.format === 'heif' && probe.compression === 'av1'
+}
 
 /**
  * Thrown only for the deliberate, user-facing validation failures below.
@@ -46,13 +60,16 @@ export async function cropTo45(buf: Buffer): Promise<Buffer> {
     throw new ImageValidationError('görsel okunamadı')
   }
 
-  if (!probe.format || !ALLOWED_FORMATS.has(probe.format)) {
+  if (!isAcceptedFormat(probe)) {
     throw new ImageValidationError('desteklenmeyen görsel biçimi')
   }
   if (!probe.width || !probe.height) {
     throw new ImageValidationError('Görsel yüklenemedi')
   }
   // Rotation swaps the axes but not the product, so this holds pre-rotation.
+  // width*height is total decoded pixels only because sharp defaults to
+  // pages: 1 — an animated file decodes its first frame and nothing more.
+  // Setting { animated: true } or pages: -1 anywhere below would invalidate this.
   if (probe.width * probe.height > MAX_PIXELS) {
     throw new ImageValidationError('görsel çok büyük — en fazla 64 megapiksel olmalı')
   }
@@ -91,5 +108,7 @@ export async function cropTo45(buf: Buffer): Promise<Buffer> {
 }
 
 export async function makeThumb(buf: Buffer): Promise<Buffer> {
-  return sharp(buf).resize(320).jpeg({ quality: 70 }).toBuffer()
+  // Same decode ceiling as cropTo45. Today this only ever sees cropTo45's own
+  // output, but it is a decode path and must not be the one that skips the cap.
+  return sharp(buf, { limitInputPixels: MAX_PIXELS }).resize(320).jpeg({ quality: 70 }).toBuffer()
 }

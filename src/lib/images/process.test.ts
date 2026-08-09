@@ -162,6 +162,17 @@ describe('cropTo45', () => {
     await expect(cropTo45(svg)).rejects.toThrow('desteklenmeyen görsel biçimi')
   })
 
+  // sharp reports AVIF as format 'heif', never 'avif', so an allowlist that
+  // names 'avif' silently rejects every AVIF file.
+  it('accepts an AVIF, which sharp reports as heif', async () => {
+    const avif = await sharp({
+      create: { width: 1000, height: 1000, channels: 3, background: { r: 9, g: 9, b: 9 } },
+    }).avif({ quality: 40 }).toBuffer()
+    expect((await sharp(avif).metadata()).format).toBe('heif')
+    const { width, height } = await sharp(await cropTo45(avif)).metadata()
+    expect(width! / height!).toBe(0.8)
+  })
+
   it('rejects a decompression bomb whose byte size is small', async () => {
     // ~40000x4000 = 160MP, over the 64MP ceiling, but only a few MB on the wire
     // because it is a single flat colour.

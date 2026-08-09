@@ -39,6 +39,18 @@ describe('POST /api/items validation', () => {
     expect(ingestBuffer).not.toHaveBeenCalled()
   })
 
+  // Next's proxy truncates rather than rejects a body over its limit, leaving
+  // a half-written multipart stream. That used to 500 with no results array.
+  it('answers 413 instead of 500 when the multipart body is unparseable', async () => {
+    const broken = new Request('http://localhost/api/items', {
+      method: 'POST',
+      headers: { 'content-type': 'multipart/form-data; boundary=----abc' },
+      body: '------abc\r\nContent-Disposition: form-data; name="files"; filename="a.jpg"\r\n\r\ntrunc',
+    })
+    const res = await POST(broken)
+    expect(res.status).toBe(413)
+  })
+
   // The original bug processed 50 files and returned a polite error for the
   // rest — after req.formData() had already buffered all of them. The cap must
   // reject the request outright instead of half-honouring it.
@@ -62,7 +74,7 @@ describe('POST /api/items validation', () => {
   })
 
   it('rejects an oversized file rather than ingesting it', async () => {
-    const res = await POST(req([jpeg(26 * 1024 * 1024, 'big.jpg')]))
+    const res = await POST(req([jpeg(5 * 1024 * 1024, 'big.jpg')]))
     const body = await res.json()
     expect(body.results[0]).toMatchObject({ status: 'error' })
     expect(body.results[0].message).toContain('dosya çok büyük')

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { ImageValidationError } from '@/src/lib/images/process'
-import { decideIngest, toIngestFailure, IngestError } from './repo'
+import { decideIngest, toIngestFailure, isStagedBlobUrl, IngestError } from './repo'
 
 describe('decideIngest', () => {
   it('adds an image whose hash is unseen', () => {
@@ -53,5 +53,46 @@ describe('toIngestFailure', () => {
   it('passes non-Error throwables through unchanged', () => {
     expect(toIngestFailure('a string')).toBe('a string')
     expect(toIngestFailure(undefined)).toBe(undefined)
+  })
+})
+
+// ingestFromUrl makes the server fetch a URL the client supplied. This guard is
+// the only thing standing between that and a server-side request forgery, so it
+// is tested against the standard bypass repertoire.
+describe('isStagedBlobUrl', () => {
+  const good = 'https://br8lst74pmncgcsn.public.blob.vercel-storage.com/tmp/abc-123.jpg'
+
+  it('accepts a staged object in our own blob store', () => {
+    expect(isStagedBlobUrl(good)).toBe(true)
+  })
+
+  it.each([
+    ['plain http', 'http://x.public.blob.vercel-storage.com/tmp/a.jpg'],
+    ['file scheme', 'file:///etc/passwd'],
+    ['cloud metadata', 'http://169.254.169.254/latest/meta-data/'],
+    ['localhost', 'https://localhost/tmp/a.jpg'],
+    ['unrelated host', 'https://evil.example.com/tmp/a.jpg'],
+    ['suffix as a prefix', 'https://public.blob.vercel-storage.com.evil.com/tmp/a.jpg'],
+    ['bare suffix host', 'https://public.blob.vercel-storage.com/tmp/a.jpg'],
+    ['suffix in path only', 'https://evil.com/.public.blob.vercel-storage.com/tmp/a.jpg'],
+    // The suffix appears in the URL and the path really does start with /tmp/,
+    // so anything matching on the whole href rather than the hostname lets it in.
+    ['suffix in the query string', 'https://evil.com/tmp/a.jpg?x=.public.blob.vercel-storage.com'],
+    ['suffix in a fragment', 'https://evil.com/tmp/a.jpg#.public.blob.vercel-storage.com'],
+    // Long enough to clear the hostname-length guard, so only the endsWith
+    // check on the hostname itself can reject it.
+    [
+      'suffix in query, long host',
+      'https://a-deliberately-long-attacker-hostname.example.com/tmp/a.jpg?x=.public.blob.vercel-storage.com',
+    ],
+    // hostname is exactly the suffix, leading dot and all — endsWith() alone says yes.
+    ['leading-dot host', 'https://.public.blob.vercel-storage.com/tmp/a.jpg'],
+    ['userinfo trick', 'https://x.public.blob.vercel-storage.com@evil.com/tmp/a.jpg'],
+    ['outside tmp/', 'https://x.public.blob.vercel-storage.com/queue/a.jpg'],
+    ['tmp without slash', 'https://x.public.blob.vercel-storage.com/tmpfoo/a.jpg'],
+    ['not a url', 'tmp/a.jpg'],
+    ['empty', ''],
+  ])('rejects %s', (_label, url) => {
+    expect(isStagedBlobUrl(url)).toBe(false)
   })
 })
