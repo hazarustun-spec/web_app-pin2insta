@@ -44,7 +44,7 @@ describe('cropTo45', () => {
   })
 
   it('throws when shorter edge is under 320px', async () => {
-    await expect(cropTo45(await solid(300, 400))).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+    await expect(cropTo45(await solid(300, 400))).rejects.toThrow('görsel çok küçük — en az 320x400px olmalı')
   })
 
   it('produces exactly 1080x1350 for large sources', async () => {
@@ -119,7 +119,7 @@ describe('cropTo45', () => {
       .jpeg()
       .toBuffer()
 
-    await expect(cropTo45(buf)).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+    await expect(cropTo45(buf)).rejects.toThrow('görsel çok küçük — en az 320x400px olmalı')
   })
 
   it('accepts 320px boundary on post-rotation short edge with EXIF orientation 6', async () => {
@@ -138,16 +138,30 @@ describe('cropTo45', () => {
   })
 
   it('rejects sources with 319px short edge', async () => {
-    await expect(cropTo45(await solid(319, 5000))).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
-    await expect(cropTo45(await solid(5000, 319))).rejects.toThrow('görsel çok küçük — en az 320px olmalı')
+    await expect(cropTo45(await solid(319, 5000))).rejects.toThrow('görsel çok küçük — en az 320x400px olmalı')
+    await expect(cropTo45(await solid(5000, 319))).rejects.toThrow('görsel çok küçük — en az 320x400px olmalı')
   })
 
-  it('accepts sources with exactly 320px short edge', async () => {
+  it('accepts a source at exactly the 320x400 floor', async () => {
     const { width, height } = await sharp(await cropTo45(await solid(320, 5000))).metadata()
     expect(width! / height!).toBe(0.8)
+    expect(width).toBeGreaterThanOrEqual(320)
 
-    const { width: w2, height: h2 } = await sharp(await cropTo45(await solid(5000, 320))).metadata()
+    const { width: w2, height: h2 } = await sharp(await cropTo45(await solid(5000, 400))).metadata()
     expect(w2! / h2!).toBe(0.8)
+    expect(w2).toBe(320)
+  })
+
+  // The guard is on the OUTPUT, which is why the source short edge alone is not
+  // enough: at 4:5 the width comes from the height, so anything under 400 tall
+  // produces an image Instagram refuses however wide the source was.
+  it.each([
+    [1920, 360],
+    [400, 320],
+    [800, 399],
+  ])('refuses %ix%i, which would crop below 320px wide', async (w, h) => {
+    await expect(cropTo45(await solid(w, h)))
+      .rejects.toThrow('görsel çok küçük — en az 320x400px olmalı')
   })
 
   // The route's Content-Type allowlist is client-supplied and proves nothing

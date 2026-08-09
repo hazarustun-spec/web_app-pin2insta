@@ -288,6 +288,8 @@ export type RefreshReport = {
   refreshed: number
   /** Items whose metrics could not be read or stored this time round. */
   skipped: number
+  /** Posts whose empty permalink this run filled in. */
+  repaired: number
   dryRun: boolean
 }
 
@@ -319,6 +321,7 @@ export async function refreshInsights(limit = REFRESH_LIMIT): Promise<RefreshRep
     .limit(limit)
 
   let refreshed = 0
+  let repaired = 0
   for (const item of posted) {
     try {
       const m = await client.insights(item.igMediaId!)
@@ -327,6 +330,20 @@ export async function refreshInsights(limit = REFRESH_LIMIT): Promise<RefreshRep
         .values({ itemId: item.id, ...m, fetchedAt })
         .onConflictDoUpdate({ target: metrics.itemId, set: { ...m, fetchedAt } })
       refreshed++
+
+      // publish() swallows a failure of its own permalink lookup on purpose:
+      // that request happens after media_publish, and letting it throw would
+      // make the scheduler treat a live post as unpublished and post it twice.
+      // The row is left with an empty permalink, and this is the only place
+      // that ever fixes it — /published otherwise shows "bağlantı
+      // kaydedilemedi" for the life of the post.
+      if (!item.permalink) {
+        const link = await client.permalink(item.igMediaId!)
+        if (link) {
+          await db.update(items).set({ permalink: link }).where(eq(items.id, item.id))
+          repaired++
+        }
+      }
     } catch (e) {
       if (isAuthError(e)) {
         // Loud, and it stops here: every remaining item would fail the same
@@ -342,7 +359,13 @@ export async function refreshInsights(limit = REFRESH_LIMIT): Promise<RefreshRep
       console.error('insights refresh skipped item', item.id, e)
     }
   }
-  return { scanned: posted.length, refreshed, skipped: posted.length - refreshed, dryRun: client.isDryRun }
+  return {
+    scanned: posted.length,
+    refreshed,
+    repaired,
+    skipped: posted.length - refreshed,
+    dryRun: client.isDryRun,
+  }
 }
 
 // ---------------------------------------------------------------------------

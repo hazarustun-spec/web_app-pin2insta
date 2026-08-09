@@ -82,9 +82,15 @@ export async function cropTo45(buf: Buffer): Promise<Buffer> {
     throw new ImageValidationError('Görsel yüklenemedi')
   }
 
+  // Instagram's floor is 320px on the OUTPUT. Guarding the source short edge is
+  // not enough: the output width is derived from the output height at 4:5, so a
+  // 1920x360 source passes a 320 check and produces a 288px-wide image that
+  // Instagram then refuses at container creation — three ticks later, as a
+  // failed card, instead of here where the owner can pick another picture.
+  // 4:5 means the height must be at least 400 for the width to reach 320.
   const shortEdge = Math.min(metadata.width, metadata.height)
-  if (shortEdge < 320) {
-    throw new ImageValidationError('görsel çok küçük — en az 320px olmalı')
+  if (shortEdge < 320 || metadata.height < 400) {
+    throw new ImageValidationError('görsel çok küçük — en az 320x400px olmalı')
   }
 
   // Calculate exact 4:5 dimensions by choosing height first as a multiple of 5.

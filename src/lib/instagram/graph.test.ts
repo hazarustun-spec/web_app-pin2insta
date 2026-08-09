@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { createGraphClient } from './graph'
+import { createGraphClient, graphBase } from './graph'
 import { InstagramError } from './types'
 
 // No network calls are made in this file — global.fetch is stubbed per-test below.
@@ -236,5 +236,104 @@ describe('graph client publish irreversibility', () => {
         caption: 'hello',
       }),
     ).rejects.toBeInstanceOf(InstagramError)
+  })
+})
+
+// Meta's publishing guide asks for a status poll between creating a container
+// and publishing it. Publishing an IN_PROGRESS container fails, runSlot reads
+// that as "nothing was posted", and three such failures retire the item.
+describe('graph client container readiness', () => {
+  beforeEach(() => {
+    process.env.IG_ACCESS_TOKEN = 'secret-token-value'
+    process.env.IG_USER_ID = 'ig-user-1'
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    global.fetch = originalFetch
+    delete process.env.IG_ACCESS_TOKEN
+    delete process.env.IG_USER_ID
+  })
+
+  /** Answers IN_PROGRESS for the first `n` status polls, then FINISHED. */
+  function readyAfter(n: number) {
+    const calls: string[] = []
+    let polls = 0
+    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      calls.push(`${init?.method ?? 'GET'} ${url.split('v25.0')[1] ?? url}`)
+      if (url.includes('status_code')) {
+        return jsonResponse(200, { status_code: polls++ < n ? 'IN_PROGRESS' : 'FINISHED' })
+      }
+      if (url.includes('fields=permalink')) return jsonResponse(200, { permalink: 'https://p/1' })
+      if (url.includes('media_publish')) return jsonResponse(200, { id: 'media-1' })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+    return calls
+  }
+
+  const feed = { kind: 'feed' as const, imageUrls: ['https://example.com/a.jpg'], caption: 'hi' }
+
+  it('waits for a container that is not ready yet, then publishes once', async () => {
+    const calls = readyAfter(2)
+    const promise = createGraphClient().publish(feed)
+    await vi.runAllTimersAsync()
+    const result = await promise
+
+    expect(result.igMediaId).toBe('media-1')
+    expect(calls.filter((c) => c.includes('status_code'))).toHaveLength(3)
+    expect(calls.filter((c) => c.includes('media_publish'))).toHaveLength(1)
+    // The poll must come before the irreversible step.
+    expect(calls.findIndex((c) => c.includes('status_code')))
+      .toBeLessThan(calls.findIndex((c) => c.includes('media_publish')))
+  })
+
+  it('does not publish a container that never finishes', async () => {
+    const calls = readyAfter(Number.POSITIVE_INFINITY)
+    const promise = createGraphClient().publish(feed)
+    const assertion = expect(promise).rejects.toBeInstanceOf(InstagramError)
+    await vi.runAllTimersAsync()
+    await assertion
+
+    expect(calls.filter((c) => c.includes('media_publish'))).toHaveLength(0)
+  })
+
+  it('gives up immediately on a container Meta has already failed', async () => {
+    const calls: string[] = []
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('status_code')) return jsonResponse(200, { status_code: 'ERROR' })
+      return jsonResponse(200, { id: 'container-1' })
+    }) as unknown as typeof fetch
+
+    await expect(createGraphClient().publish(feed)).rejects.toThrow('container error')
+    expect(calls.filter((c) => c.includes('status_code'))).toHaveLength(1)
+  })
+})
+
+// .env.example tells the owner to leave GRAPH_BASE empty for the default, and
+// `??` does not treat an empty string as absent. `${''}/123/media` is an
+// invalid URL, and the TypeError it raises is not an InstagramError — so every
+// post would fail with a generic message and burn all three retries.
+describe('graphBase', () => {
+  const saved = process.env.GRAPH_BASE
+  afterEach(() => {
+    if (saved === undefined) delete process.env.GRAPH_BASE
+    else process.env.GRAPH_BASE = saved
+  })
+
+  it.each([['unset', undefined], ['empty', ''], ['whitespace', '  ']])(
+    'falls back to the default when %s',
+    (_label, value) => {
+      if (value === undefined) delete process.env.GRAPH_BASE
+      else process.env.GRAPH_BASE = value
+      expect(graphBase()).toBe('https://graph.facebook.com/v25.0')
+    },
+  )
+
+  it('honours a real override, so the version can be pinned', () => {
+    process.env.GRAPH_BASE = 'https://graph.facebook.com/v23.0'
+    expect(graphBase()).toBe('https://graph.facebook.com/v23.0')
   })
 })

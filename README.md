@@ -30,11 +30,15 @@ npx tsc --noEmit
 npm run build
 ```
 
-Without `IG_ACCESS_TOKEN` and `IG_USER_ID` the tool runs in **dry run**: it
-validates exactly what it would send, marks items posted with a placeholder
-permalink, and returns synthetic metrics. The whole flow — upload, caption,
-schedule, history — works before the Instagram account exists. Connecting the
-real account is an environment change, not a code change.
+Without `IG_ACCESS_TOKEN` and `IG_USER_ID` the tool runs in **dry run**:
+uploading, captioning, ordering, grouping and the schedule view all work
+before the Instagram account exists, and connecting the real account is an
+environment change rather than a code change.
+
+The one thing dry run does *not* do by default is publish. A dry-run post is
+indistinguishable from a real one where it counts — the item is marked
+published, the full-size image is replaced by a thumbnail and the original
+deleted — so it is gated behind `ALLOW_DRYRUN_PUBLISH=1`. See step 4 below.
 
 ## Deploying
 
@@ -44,11 +48,19 @@ real account is an environment change, not a code change.
 integrations and are already set. Add the three secrets:
 
 ```bash
-openssl rand -hex 16 | vercel env add ADMIN_PASSWORD production
-openssl rand -hex 32 | vercel env add SESSION_SECRET production
-openssl rand -hex 32 | vercel env add CRON_SECRET production
+# printf, not echo: openssl adds a trailing newline, and a secret with edge
+# whitespace can never match a header HTTP has already trimmed.
+P=$(openssl rand -hex 16); echo "ADMIN_PASSWORD=$P   ← save this, it is your login"
+printf '%s' "$P"                | vercel env add ADMIN_PASSWORD production
+printf '%s' "$(openssl rand -hex 32)" | vercel env add SESSION_SECRET production
+C=$(openssl rand -hex 32); echo "CRON_SECRET=$C      ← save this, GitHub needs it"
+printf '%s' "$C"                | vercel env add CRON_SECRET production
+
 vercel deploy --prod
 ```
+
+If you lose the password, `vercel env pull .env.local` prints it back into that
+file.
 
 Three things that will otherwise cost you an afternoon:
 
@@ -83,8 +95,33 @@ first.
 curl -X POST "$APP_URL/api/cron/publish" -H "authorization: Bearer $CRON_SECRET"
 ```
 
-Expect JSON with `"dryRun": true` and one entry per due slot. A wrong secret is
-`401`; an unset one is `503`. The endpoint is POST-only — a GET is a 405.
+Expect `{"slots":[],"dryRun":true,"disabled":true}` until an Instagram account
+is connected — `disabled` means the scheduler declined to run rather than
+consume the queue pretending to post (step 4). A wrong secret is `401`; an
+unset one is `503`. The endpoint is POST-only — a GET is a 405.
+
+### 4. Before the Instagram account exists
+
+The scheduler does nothing until an account is connected. That is deliberate:
+a dry-run post is not a rehearsal — it marks the item published, replaces the
+full-size image with a 320px thumbnail and deletes the original, and a
+published item cannot be deleted or re-queued because its hash has to survive
+to stop a repost. Left running through the days it takes to get a Meta app
+approved, it would quietly eat three real photos a day.
+
+To exercise the publishing path on purpose, set `ALLOW_DRYRUN_PUBLISH=1` — and
+expect it to consume the queue.
+
+### 5. The database schema
+
+The tables were created with `drizzle-kit push` and there are no migration
+files. If the Neon database is ever recreated:
+
+```bash
+npm run db:push
+```
+
+The app does not need a `settings` row — every field falls back to its default.
 
 ## Connecting the Instagram account
 

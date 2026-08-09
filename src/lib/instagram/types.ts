@@ -13,6 +13,15 @@ export type Insights = { likes: number; comments: number; reach: number; saved: 
 export interface InstagramClient {
   publish(input: PublishInput): Promise<PublishResult>
   insights(mediaId: string): Promise<Insights>
+  /**
+   * The permalink of an already-published media.
+   *
+   * `publish()` deliberately swallows a failure of its own permalink lookup —
+   * that request happens after media_publish, and letting it throw would make
+   * the scheduler treat a live post as unpublished and post it again. The row
+   * is left with an empty permalink instead, and this is how it gets repaired.
+   */
+  permalink(mediaId: string): Promise<string>
   isDryRun: boolean
 }
 

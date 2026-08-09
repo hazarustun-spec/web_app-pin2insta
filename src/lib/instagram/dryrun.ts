@@ -5,6 +5,9 @@ let counter = 0
 export function createDryRunClient(): InstagramClient {
   return {
     isDryRun: true,
+    async permalink(mediaId: string) {
+      return `https://instagram.com/p/${mediaId}?dryrun=1`
+    },
     async publish(input: PublishInput) {
       validate(input)
       const id = `dryrun-${++counter}`

@@ -170,7 +170,35 @@ export type SlotOutcome =
 
 export type SlotResult = { date: string; index: number; outcome: SlotOutcome; itemId?: string }
 
-export type PublishReport = { slots: SlotResult[]; dryRun: boolean }
+export type PublishReport = {
+  slots: SlotResult[]
+  dryRun: boolean
+  /** Set when the run did nothing because dry-run publishing is not enabled. */
+  disabled?: true
+}
+
+/**
+ * Whether a dry run is allowed to actually consume the queue.
+ *
+ * A dry run is not a rehearsal — it is indistinguishable from a real one
+ * everywhere it matters. It marks the item `posted`, replaces the full-size
+ * blob with a 320px thumbnail and deletes the original, and `deleteItem` then
+ * refuses to remove a posted row because the hash must survive to stop a
+ * repost. So the picture cannot be re-queued (the hash answers "zaten var"),
+ * cannot be deleted, and no longer exists at full size.
+ *
+ * That matters because of the order the README asks for: set the secrets, wire
+ * the scheduler, THEN spend days converting the Instagram account and getting a
+ * Meta app approved. A cron running through those days against the dry-run
+ * client would quietly eat three real photos a day, and /published would show
+ * them as ordinary posts with a link to instagram.com/p/dryrun-1.
+ *
+ * So it is opt-in. Setting this is how you say "yes, pretend to post, I know it
+ * consumes the queue".
+ */
+export function dryRunPublishingEnabled(): boolean {
+  return process.env.ALLOW_DRYRUN_PUBLISH === '1'
+}
 
 type Db = ReturnType<typeof getDb>
 type ImageRow = { id: string; url: string; hash: string }
@@ -395,6 +423,9 @@ async function runSlot(
 export async function runPublish(now: Date): Promise<PublishReport> {
   const db = getDb()
   const client = getInstagramClient()
+  if (client.isDryRun && !dryRunPublishingEnabled()) {
+    return { slots: [], dryRun: true, disabled: true }
+  }
   const [row] = await db.select().from(settings).where(eq(settings.id, 1))
   const cfg = resolveSettings(row)
 

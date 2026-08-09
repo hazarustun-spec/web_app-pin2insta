@@ -26,10 +26,12 @@ import {
 type Row = Record<string, unknown>
 type SelectRec = { table: string; join?: string; where?: unknown; order?: unknown[]; limit?: number }
 type InsertRec = { table: string; values: Row; conflict?: unknown }
+type UpdateRec = { table: string; values: Row; where: unknown }
 
 const selects = vi.hoisted(() => [] as SelectRec[])
 const joins = vi.hoisted(() => [] as unknown[])
 const inserts = vi.hoisted(() => [] as InsertRec[])
+const updates = vi.hoisted(() => [] as UpdateRec[])
 const state = vi.hoisted(() => ({
   items: [] as Row[],
   images: [] as Row[],
@@ -112,6 +114,17 @@ vi.mock('@/src/db', async () => {
           return select(rec)
         },
       }),
+      // Records the statement rather than evaluating its WHERE — this file's
+      // fake has no where-evaluator, and asserting on the recorded update is
+      // the honest version of "the repair was issued".
+      update: (table: unknown) => ({
+        set: (values: Row) => ({
+          where: (w: unknown) => {
+            updates.push({ table: getTableName(table as never), values, where: w })
+            return Promise.resolve([])
+          },
+        }),
+      }),
       insert: (table: unknown) => ({
         values: (values: Row) => {
           const rec: InsertRec = { table: getTableName(table as never), values }
@@ -138,6 +151,7 @@ const client = vi.hoisted(() => ({
   isDryRun: false,
   insights: vi.fn(),
   publish: vi.fn(),
+  permalink: vi.fn(),
 }))
 
 /**
@@ -155,6 +169,7 @@ vi.mock('@/src/lib/instagram', async (importOriginal) => ({
 beforeEach(() => {
   selects.length = 0
   inserts.length = 0
+  updates.length = 0
   joins.length = 0
   state.items = []
   state.images = []
@@ -162,6 +177,9 @@ beforeEach(() => {
   realClient.value = null
   client.isDryRun = false
   client.insights.mockReset().mockResolvedValue({ likes: 1, comments: 2, reach: 3, saved: 4 })
+  client.permalink.mockReset().mockImplementation(
+    async (id: string) => `https://instagram.com/p/${id}?dryrun=1`,
+  )
   vi.spyOn(console, 'error').mockImplementation(() => {})
 })
 
@@ -387,6 +405,7 @@ describe('formatPostedAt', () => {
 
 const posted = (id: string, igMediaId: string | null = `ig-${id}`) => ({
   id, igMediaId, status: 'posted', postedAt: new Date('2026-08-12T11:00:00Z'),
+  permalink: `https://instagram.com/p/${igMediaId}`,
 })
 
 describe('refreshInsights', () => {
@@ -417,7 +436,7 @@ describe('refreshInsights', () => {
     expect(inserts[0].values).toMatchObject({ itemId: 'a', likes: 1, comments: 2, reach: 3, saved: 4 })
     // metrics.itemId is the primary key: a second run must overwrite, not fail.
     expect(inserts[0].conflict).toMatchObject({ target: metrics.itemId })
-    expect(report).toEqual({ scanned: 2, refreshed: 2, skipped: 0, dryRun: false })
+    expect(report).toEqual({ scanned: 2, refreshed: 2, skipped: 0, repaired: 0, dryRun: false })
   })
 
   it('runs end to end against the real dry-run client', async () => {
@@ -430,7 +449,7 @@ describe('refreshInsights', () => {
     realClient.value = createDryRunClient()
     state.items = [posted('a'), posted('b')]
 
-    expect(await refreshInsights()).toEqual({ scanned: 2, refreshed: 2, skipped: 0, dryRun: true })
+    expect(await refreshInsights()).toEqual({ scanned: 2, refreshed: 2, skipped: 0, repaired: 0, dryRun: true })
     expect(inserts.map((i) => i.values)).toMatchObject([
       { itemId: 'a', likes: 0, comments: 0, reach: 0, saved: 0 },
       { itemId: 'b', likes: 0, comments: 0, reach: 0, saved: 0 },
@@ -445,7 +464,7 @@ describe('refreshInsights', () => {
     client.isDryRun = true
     client.insights.mockResolvedValue({ likes: 0, comments: 0, reach: 0, saved: 0 })
     state.items = [posted('a')]
-    expect(await refreshInsights()).toEqual({ scanned: 1, refreshed: 1, skipped: 0, dryRun: true })
+    expect(await refreshInsights()).toEqual({ scanned: 1, refreshed: 1, skipped: 0, repaired: 0, dryRun: true })
   })
 
   it('skips an item whose metrics are not available yet and carries on', async () => {
@@ -454,7 +473,7 @@ describe('refreshInsights', () => {
     state.items = [posted('a'), posted('b')]
     client.insights.mockRejectedValueOnce(new InstagramError('no data', 400, 'GraphMethodException'))
     const report = await refreshInsights()
-    expect(report).toEqual({ scanned: 2, refreshed: 1, skipped: 1, dryRun: false })
+    expect(report).toEqual({ scanned: 2, refreshed: 1, skipped: 1, repaired: 0, dryRun: false })
     expect(inserts.map((i) => i.values.itemId)).toEqual(['b'])
   })
 
@@ -491,10 +510,36 @@ describe('refreshInsights', () => {
     expect(logged.map(String).join(' ')).toContain('the-stuck-one')
   })
 
+  // publish() swallows a failure of its own permalink lookup on purpose: that
+  // request happens after media_publish, so letting it throw would make the
+  // scheduler treat a live post as unpublished and post it again. The row is
+  // left with an empty permalink, and this loop is the only thing that ever
+  // fixes it.
+  it('fills in a permalink that publishing could not record', async () => {
+    state.items = [{ ...posted('a'), permalink: '' }]
+    const report = await refreshInsights()
+
+    expect(report.repaired).toBe(1)
+    expect(updates).toEqual([{
+      table: 'items',
+      values: { permalink: 'https://instagram.com/p/ig-a?dryrun=1' },
+      where: eq(items.id, 'a'),
+    }])
+  })
+
+  it('leaves a permalink alone when the post already has one', async () => {
+    state.items = [posted('a')]
+    const report = await refreshInsights()
+
+    expect(report.repaired).toBe(0)
+    expect(updates).toEqual([])
+    expect(client.permalink).not.toHaveBeenCalled()
+  })
+
   it('counts a failed write as skipped rather than as refreshed', async () => {
     state.items = [posted('a')]
     state.insertError = new Error('neon: connection to ep-secret.aws.neon.tech failed')
-    expect(await refreshInsights()).toEqual({ scanned: 1, refreshed: 0, skipped: 1, dryRun: false })
+    expect(await refreshInsights()).toEqual({ scanned: 1, refreshed: 0, skipped: 1, repaired: 0, dryRun: false })
   })
 
   it('honours an explicit limit', async () => {

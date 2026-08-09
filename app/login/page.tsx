@@ -1,7 +1,9 @@
 'use client'
 import { useState } from 'react'
+import { useRouter } from 'next/navigation'
 
 export default function Login() {
+  const router = useRouter()
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
 
@@ -12,8 +14,19 @@ export default function Login() {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ password }),
     })
-    if (res.ok) location.href = '/'
-    else setError('Yanlış şifre')
+    if (res.ok) {
+      router.push('/')
+      return
+    }
+    // 503 is not a wrong password: it is ADMIN_PASSWORD or SESSION_SECRET
+    // missing from the environment, which is the state every deployment starts
+    // in. Saying "wrong password" there tells the owner their brand-new random
+    // password is wrong, on the very first screen of the app.
+    setError(
+      res.status === 503
+        ? 'Sunucu yapılandırılmamış — ADMIN_PASSWORD ve SESSION_SECRET ayarlanmalı.'
+        : 'Yanlış şifre',
+    )
   }
 
   return (

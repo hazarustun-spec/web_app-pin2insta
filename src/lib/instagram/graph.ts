@@ -1,6 +1,19 @@
 import { validate, isAuthError, InstagramError, type InstagramClient, type PublishInput } from './types'
 
-const BASE = process.env.GRAPH_BASE ?? 'https://graph.facebook.com/v25.0'
+const DEFAULT_GRAPH_BASE = 'https://graph.facebook.com/v25.0'
+
+/**
+ * The Graph API root.
+ *
+ * Read per call, and trimmed rather than tested with `??`: .env.example tells
+ * the owner to leave GRAPH_BASE empty for the default, and neither an empty
+ * string nor a stray space is nullish. `${''}/123/media` is an invalid URL, and
+ * the TypeError it raises is not an InstagramError — so every post would fail
+ * with a generic message and burn all three retries.
+ */
+export function graphBase(): string {
+  return process.env.GRAPH_BASE?.trim() || DEFAULT_GRAPH_BASE
+}
 
 /**
  * Parses a Graph API response defensively. A non-JSON body (e.g. an HTML error page from an
@@ -31,7 +44,7 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
   // exactly the kind of thing generic instrumentation (Sentry breadcrumbs, OTel auto-instrumentation,
   // verbose fetch logging) captures by default.
   const headers = { Authorization: `Bearer ${token}` }
-  const url = new URL(`${BASE}${path}`)
+  const url = new URL(`${graphBase()}${path}`)
   const body = new URLSearchParams(params)
   const res = method === 'GET'
     ? await fetch(`${url}?${body}`, { headers })
@@ -42,6 +55,36 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
 async function container(igUserId: string, params: Record<string, string>): Promise<string> {
   const { id } = await call(`/${igUserId}/media`, params, 'POST')
   return id
+}
+
+/** How long to wait for a container to finish before giving up and letting the tick retry. */
+const READY_ATTEMPTS = 6
+const READY_DELAY_MS = 2000
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * Waits for a container to reach FINISHED.
+ *
+ * Meta's publishing guide asks for this, and it is not ceremony: publishing an
+ * IN_PROGRESS container fails, `runSlot` correctly reads that as "nothing was
+ * posted", and three such failures fifteen minutes apart retire the item for
+ * good. Image containers are usually ready at once — a carousel of ten is the
+ * case that will not be.
+ *
+ * A container that never finishes throws, which is the right outcome: the slot
+ * is released and the next tick tries again.
+ */
+async function awaitContainer(creationId: string): Promise<void> {
+  for (let attempt = 0; attempt < READY_ATTEMPTS; attempt++) {
+    const { status_code: status } = await call(`/${creationId}`, { fields: 'status_code' }, 'GET')
+    if (status === 'FINISHED' || status === undefined) return
+    if (status === 'ERROR' || status === 'EXPIRED') {
+      throw new InstagramError(`container ${String(status).toLowerCase()}`)
+    }
+    await sleep(READY_DELAY_MS)
+  }
+  throw new InstagramError('container did not finish in time')
 }
 
 export function createGraphClient(): InstagramClient {
@@ -88,6 +131,8 @@ export function createGraphClient(): InstagramClient {
         })
       }
 
+      await awaitContainer(creationId)
+
       const { id } = await call(`/${igUserId}/media_publish`, { creation_id: creationId }, 'POST')
 
       // NOTHING BELOW THIS LINE MAY THROW. media_publish is the irreversible
@@ -106,6 +151,10 @@ export function createGraphClient(): InstagramClient {
         console.error('permalink lookup failed after publishing', id, e)
       }
       return { igMediaId: id, permalink }
+    },
+
+    async permalink(mediaId: string) {
+      return (await call(`/${mediaId}`, { fields: 'permalink' }, 'GET')).permalink ?? ''
     },
 
     async insights(mediaId: string) {

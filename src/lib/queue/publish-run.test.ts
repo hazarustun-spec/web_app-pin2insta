@@ -72,7 +72,9 @@ const okPublish = () =>
 
 /** A client that records its calls; `publish` defaults to a successful post. */
 function spyClient(publish = okPublish()) {
-  const client: InstagramClient = { isDryRun: true, publish, insights: vi.fn() }
+  const client: InstagramClient = {
+    isDryRun: true, publish, insights: vi.fn(), permalink: vi.fn(async () => ''),
+  }
   clientOverride.value = client
   return publish
 }
@@ -89,6 +91,9 @@ beforeEach(() => {
   // the environment would make these tests post to a real account.
   delete process.env.IG_ACCESS_TOKEN
   delete process.env.IG_USER_ID
+  // These tests are exactly the case the opt-in exists for: exercising the
+  // publish path against the dry-run client, deliberately.
+  process.env.ALLOW_DRYRUN_PUBLISH = '1'
   uploadImage.mockReset().mockResolvedValue({ url: 'https://blob.example/thumb/t.jpg', pathname: 'thumb/t.jpg' })
   deleteImage.mockReset().mockResolvedValue(undefined)
   makeThumb.mockReset().mockResolvedValue(Buffer.from('thumb-bytes'))
@@ -104,6 +109,7 @@ afterEach(() => {
   else process.env.IG_ACCESS_TOKEN = savedIgEnv.token
   if (savedIgEnv.user === undefined) delete process.env.IG_USER_ID
   else process.env.IG_USER_ID = savedIgEnv.user
+  delete process.env.ALLOW_DRYRUN_PUBLISH
 })
 
 // A fresh Response per call: a body can only be read once, so a shared
@@ -745,5 +751,77 @@ describe('runPublish: thumbnail refresh never undoes a published post', () => {
     expect(uploadImage).not.toHaveBeenCalled()
     expect(deleteImage).not.toHaveBeenCalled()
     expect(state.images[0].url).toBe(original)
+  })
+})
+
+/**
+ * A dry run is not a rehearsal. It marks the item posted, swaps the full-size
+ * blob for a thumbnail and deletes the original — and deleteItem then refuses
+ * to remove a posted row, so the picture can be neither re-queued (the hash
+ * answers "zaten var") nor deleted. Left on by default it would quietly eat
+ * three real photos a day for however long it takes to get a Meta app approved,
+ * which is exactly the window the README's own ordering creates.
+ */
+describe('runPublish — dry-run publishing is opt-in', () => {
+  it('does nothing at all when the opt-in is absent', async () => {
+    delete process.env.ALLOW_DRYRUN_PUBLISH
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem()
+    const original = String(seedImage().url)
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report).toEqual({ slots: [], dryRun: true, disabled: true })
+    // The queue is untouched: still pending, still holding its full-size image.
+    expect(itemRow().status).toBe('pending')
+    expect(itemRow().postedDate).toBeNull()
+    expect(state.images[0].url).toBe(original)
+    expect(deleteImage).not.toHaveBeenCalled()
+  })
+
+  it.each([['0'], ['true'], ['yes'], ['']])(
+    'treats %j as not opted in',
+    async (value) => {
+      process.env.ALLOW_DRYRUN_PUBLISH = value
+      state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+      seedItem()
+      seedImage()
+
+      expect(await runPublish(AT_10_05)).toEqual({ slots: [], dryRun: true, disabled: true })
+      expect(itemRow().status).toBe('pending')
+    },
+  )
+
+  it('publishes normally once the owner opts in', async () => {
+    process.env.ALLOW_DRYRUN_PUBLISH = '1'
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem()
+    seedImage()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.disabled).toBeUndefined()
+    expect(report.slots[0]).toMatchObject({ outcome: 'posted' })
+    expect(itemRow().status).toBe('posted')
+  })
+
+  it('never blocks a real client, whatever the opt-in says', async () => {
+    delete process.env.ALLOW_DRYRUN_PUBLISH
+    state.settings.push({ id: 1, slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: '' })
+    seedItem()
+    seedImage()
+    // isDryRun: false — a configured account must publish regardless.
+    clientOverride.value = {
+      isDryRun: false,
+      publish: okPublish(),
+      insights: vi.fn(),
+      permalink: vi.fn(async () => ''),
+    }
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.dryRun).toBe(false)
+    expect(report.disabled).toBeUndefined()
+    expect(report.slots[0]).toMatchObject({ outcome: 'posted' })
   })
 })
