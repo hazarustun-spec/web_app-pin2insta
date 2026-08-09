@@ -11,6 +11,7 @@ import {
   PinError,
   MAX_HTML_BYTES,
   MAX_IMAGE_BYTES,
+  MAX_REDIRECTS,
 } from './pinterest'
 
 // ---------------------------------------------------------------------------
@@ -169,6 +170,19 @@ describe('extractOgImage', () => {
   it('does not read content from a neighbouring tag', () => {
     const html =
       '<meta property="og:title" content="a title">' + '<meta property="og:image">'
+    expect(extractOgImage(html)).toBe(null)
+  })
+
+  // The order above is the one a tag-spanning scan still gets right by luck.
+  // With the bare og:image FIRST, anything that reads across the tag boundary
+  // returns the next tag's content instead of null.
+  it('does not mistake <metadata> for a meta tag', () => {
+    const html = '<metadata property="og:image" content="https://i.pinimg.com/evil.jpg"></metadata>'
+    expect(extractOgImage(html)).toBe(null)
+  })
+
+  it('does not read content from the tag after a bare og:image', () => {
+    const html = '<meta property="og:image"><meta property="og:title" content="EVIL">'
     expect(extractOgImage(html)).toBe(null)
   })
 
@@ -379,7 +393,11 @@ describe('fetchPinImage', () => {
 
   it('tells the owner to drop the image when Pinterest blocks the page', async () => {
     const { impl } = stub({ [PAGE]: () => new Response('nope', { status: 403 }) })
-    await expect(fetchPinImage(PAGE, impl)).rejects.toThrow(/indirip/)
+    // Every failure message ends with the same "indirip sürükle" guidance, so
+    // asserting only that matches all of them and pins nothing. The page-status
+    // branch has to be named specifically or deleting it goes unnoticed — a 403
+    // body simply yields "no og:image" instead.
+    await expect(fetchPinImage(PAGE, impl)).rejects.toThrow(/sayfası açılamadı/)
   })
 
   it('tells the owner to drop the image when the page has no og:image', async () => {
@@ -447,7 +465,11 @@ describe('fetchPinImage', () => {
       [other]: () => new Response(null, { status: 302, headers: { location: PAGE } }),
     })
     await expect(fetchPinImage(PAGE, impl)).rejects.toThrow(PinError)
-    expect(calls.length).toBeLessThanOrEqual(8)
+    // Literal, not MAX_REDIRECTS + 1: deriving the expectation from the
+    // constant makes the test agree with whatever the constant says, so
+    // raising the limit would pass. Three hops plus the original request.
+    expect(MAX_REDIRECTS).toBe(3)
+    expect(calls.length).toBe(4)
   })
 
   it('refuses a redirect with no Location header', async () => {

@@ -11,7 +11,8 @@ import { ingestBuffer, IngestError } from '@/src/lib/queue/repo'
  * malformed body and to decide what the client is allowed to read.
  */
 
-// Two fetches with a 10s and a 20s timeout, plus a crop, a hash and an upload.
+// Two fetches under PAGE_TIMEOUT_MS and IMAGE_TIMEOUT_MS, under one shared
+// budget, plus a crop, a hash and an upload.
 // Well inside this; the timeouts, not the ceiling, are what bound a slow pin.
 export const maxDuration = 60
 
