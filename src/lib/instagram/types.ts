@@ -31,6 +31,22 @@ export class InstagramError extends Error {
 }
 
 /**
+ * True for a dead or insufficiently-scoped token — must never be masked as
+ * "zero engagement".
+ *
+ * Lives here, beside the error it inspects, because two callers now depend on
+ * exactly this distinction: `insights()` in graph.ts, which lets a
+ * genuinely-empty insights response become zeros but rethrows this, and
+ * `refreshInsights` in Task 12, which writes those zeros to a table whose whole
+ * purpose is averaging them. A second copy of this predicate that drifted from
+ * the first would silently poison the averages the suggestion is computed from.
+ */
+export function isAuthError(err: unknown): boolean {
+  return err instanceof InstagramError
+    && (err.status === 401 || err.status === 403 || err.type === 'OAuthException')
+}
+
+/**
  * Rejects payloads Instagram would reject, so dry-run and live behave identically.
  * A caption on a `story` input passes validation but is intentionally discarded at publish
  * time — the Graph API has no caption field for `media_type=STORIES`.

@@ -1,6 +1,6 @@
 // src/lib/queue/slots.test.ts
 import { describe, it, expect } from 'vitest'
-import { slotAt, dueSlots, upcomingSlots, slotIndexFor } from './slots'
+import { slotAt, dueSlots, upcomingSlots, slotIndexFor, slotTimeFor } from './slots'
 
 const TZ = 'Europe/Istanbul'
 const SLOTS = ['10:00', '14:00', '20:00']
@@ -111,5 +111,32 @@ describe('slotIndexFor — a slot is identified by its time, not by its place in
     expect(indexOfTen(['09:00', '10:00', '14:00', '20:00'])).toBe(600)
     expect(indexOfTen(['10:00', '20:00'])).toBe(600)
     expect(indexOfTen(['20:00', '14:00', '10:00'])).toBe(600)
+  })
+})
+
+describe('slotTimeFor — the inverse, so nothing the owner reads ever says "slot 600"', () => {
+  it('turns minutes since midnight back into a zero-padded wall-clock time', () => {
+    expect(slotTimeFor(0)).toBe('00:00')
+    expect(slotTimeFor(600)).toBe('10:00')
+    expect(slotTimeFor(840)).toBe('14:00')
+    expect(slotTimeFor(1439)).toBe('23:59')
+    expect(slotTimeFor(9)).toBe('00:09')
+  })
+
+  it('round-trips every minute of the day', () => {
+    for (let i = 0; i < 1440; i++) {
+      expect(slotIndexFor(slotTimeFor(i)!)).toBe(i)
+    }
+  })
+
+  it('returns null for a value that is not a minute of the day', () => {
+    // items.slot_index is a plain nullable integer, so a hand-edited or
+    // legacy row can hold a position (0-2 is ambiguous but harmless) or
+    // anything else. A caller that cannot be given a time must be told so
+    // rather than handed "24:00" or "NaN:NaN".
+    expect(slotTimeFor(1440)).toBe(null)
+    expect(slotTimeFor(-1)).toBe(null)
+    expect(slotTimeFor(6.5)).toBe(null)
+    expect(slotTimeFor(NaN)).toBe(null)
   })
 })

@@ -1,4 +1,4 @@
-import { validate, InstagramError, type InstagramClient, type PublishInput } from './types'
+import { validate, isAuthError, InstagramError, type InstagramClient, type PublishInput } from './types'
 
 const BASE = process.env.GRAPH_BASE ?? 'https://graph.facebook.com/v25.0'
 
@@ -42,11 +42,6 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
 async function container(igUserId: string, params: Record<string, string>): Promise<string> {
   const { id } = await call(`/${igUserId}/media`, params, 'POST')
   return id
-}
-
-/** True for a dead or insufficiently-scoped token — must never be masked as "zero engagement". */
-function isAuthError(err: unknown): boolean {
-  return err instanceof InstagramError && (err.status === 401 || err.status === 403 || err.type === 'OAuthException')
 }
 
 export function createGraphClient(): InstagramClient {

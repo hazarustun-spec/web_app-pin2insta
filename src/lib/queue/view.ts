@@ -227,7 +227,8 @@ export function awaitsSlot(item: Pick<ViewItem, 'status' | 'postedDate'>): boole
   return item.status === 'pending' && item.postedDate === null
 }
 
-const MONTHS_TR = [
+/** Exported so the published-history page names months the same way this one does. */
+export const MONTHS_TR = [
   'Oca', 'Şub', 'Mar', 'Nis', 'May', 'Haz',
   'Tem', 'Ağu', 'Eyl', 'Eki', 'Kas', 'Ara',
 ]

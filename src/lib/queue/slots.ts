@@ -40,6 +40,33 @@ export function slotIndexFor(time: string): number {
   return hh * 60 + mm
 }
 
+/** Minutes in a day. `slotIndexFor` can only ever produce 0-1439. */
+const MINUTES_PER_DAY = 1440
+
+/**
+ * The inverse of `slotIndexFor`: the wall-clock time a stored `slot_index` means.
+ *
+ * Task 12 exists because `items.slot_index` is now a number nobody can read.
+ * "slot 600" on the history page and "slot 600 is your weakest" in the
+ * suggestion are both meaningless to the owner, who chose "10:00" — so every
+ * place a slot is named goes through here and the raw integer never reaches a
+ * screen.
+ *
+ * Returns null rather than a made-up time for a value outside 0-1439 or a
+ * non-integer. `slot_index` is a plain nullable integer column, so a row
+ * written by hand — or by the pre-Task-10 code, which stored a POSITION —
+ * can hold anything; 1440 is not "24:00" and NaN is not "NaN:NaN".
+ * (A legacy position of 0/1/2 is indistinguishable from 00:00/00:01/00:02 and
+ * is rendered as such: this app has never run against a real account, so no
+ * such row exists.)
+ */
+export function slotTimeFor(index: number): string | null {
+  if (!Number.isInteger(index) || index < 0 || index >= MINUTES_PER_DAY) return null
+  const hh = Math.floor(index / 60)
+  const mm = index % 60
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`
+}
+
 /** The calendar date in `timeZone` at instant `now`, as `YYYY-MM-DD`. */
 export function localDate(now: Date, timeZone: string): string {
   return new Intl.DateTimeFormat('en-CA', {
