@@ -207,12 +207,12 @@ export function labelForSlot(slot: SlotRef, settings: ViewSettings, now: Date): 
 /**
  * When each item goes out, by id.
  *
- * Slots are handed to items in queue order — which is what happens once every
- * caption is written. An uncaptioned item still consumes its slot here even
- * though the scheduler would leave that slot empty; the alternative (shifting
- * everyone up) would promise a schedule that only holds if the owner never
- * writes the caption. The head-blocked banner is what says the schedule is
- * actually stopped.
+ * Slots are handed to items in queue order, up to the first item that cannot
+ * use one. An uncaptioned item does not yield its turn — selectForSlot leaves
+ * the slot empty and meets the same item at the head next tick — so nothing
+ * behind it has a knowable time and this returns no label for it or for
+ * anything after it. Items that are `failed` or posted-unrecorded are not
+ * blockages: no slot is spent on them either, so labelling continues past.
  *
  * Items that no slot will ever be spent on — `failed`, and `posted-unrecorded`
  * — are skipped entirely and get no entry.
@@ -245,7 +245,7 @@ export type QueueStatus = {
   waiting: number
   /** Whole days of posting left at the configured rate. */
   daysLeft: number
-  /** Uncaptioned items anywhere in the queue. */
+  /** Uncaptioned items a slot would otherwise be spent on. */
   missingCaptions: number
   /**
    * The head item, when it is uncaptioned. This is the state that matters:
