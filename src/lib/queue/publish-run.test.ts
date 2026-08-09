@@ -32,6 +32,9 @@ vi.mock('@/src/lib/instagram', async (importOriginal) => {
 })
 
 const { runPublish, MAX_ATTEMPTS } = await import('./publish')
+// The settings screen's own normaliser: the slot arrays below are exactly what
+// `saveSettings` would have written to the row.
+const { validateSlots } = await import('@/src/lib/settings')
 
 // 10:05 in Europe/Istanbul (UTC+3, no DST) on 2026-08-10 — five minutes into
 // the first default slot, which is where a 15-minute cron tick lands.
@@ -109,7 +112,7 @@ const okFetch = () => fetchSpy.mockImplementation(async () => new Response(new U
 
 describe('runPublish — the happy path on a fresh database', () => {
   it('posts the head of the queue into the due slot with no settings row at all', async () => {
-    // Task 10 owns the settings UI and has not run: `settings` is EMPTY here.
+    // The settings row has never been written: `settings` is EMPTY here.
     seedItem()
     seedImage()
     okFetch()
@@ -117,11 +120,11 @@ describe('runPublish — the happy path on a fresh database', () => {
     const report = await runPublish(AT_10_05)
 
     expect(report.dryRun).toBe(true)
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted', itemId: 'a' }])
     expect(itemRow()).toMatchObject({
       status: 'posted',
       postedDate: TODAY,
-      slotIndex: 0,
+      slotIndex: 600,
       postedAt: AT_10_05,
       error: null,
       attempts: 0,
@@ -153,7 +156,7 @@ describe('runPublish — the happy path on a fresh database', () => {
 
     const report = await runPublish(new Date('2026-08-10T08:05:00Z'))
 
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 540, outcome: 'posted', itemId: 'a' }])
   })
 
   it('swaps the full-size blob for a thumbnail and deletes the original', async () => {
@@ -183,11 +186,11 @@ describe('runPublish — the happy path on a fresh database', () => {
     const report = await runPublish(new Date('2026-08-10T07:35:00Z'))
 
     expect(report.slots).toEqual([
-      { date: TODAY, index: 0, outcome: 'posted', itemId: 'a' },
-      { date: TODAY, index: 1, outcome: 'posted', itemId: 'b' },
+      { date: TODAY, index: 600, outcome: 'posted', itemId: 'a' },
+      { date: TODAY, index: 630, outcome: 'posted', itemId: 'b' },
     ])
-    expect(itemRow('a')).toMatchObject({ slotIndex: 0 })
-    expect(itemRow('b')).toMatchObject({ slotIndex: 1 })
+    expect(itemRow('a')).toMatchObject({ slotIndex: 600 })
+    expect(itemRow('b')).toMatchObject({ slotIndex: 630 })
   })
 })
 
@@ -202,7 +205,7 @@ describe('runPublish — idempotence', () => {
     const second = await runPublish(new Date('2026-08-10T07:20:00Z'))
 
     expect(publish).not.toHaveBeenCalled()
-    expect(second.slots).toEqual([{ date: TODAY, index: 0, outcome: 'already-filled' }])
+    expect(second.slots).toEqual([{ date: TODAY, index: 600, outcome: 'already-filled' }])
   })
 
   it('does not backfill a slot that went by more than the grace window ago', async () => {
@@ -236,7 +239,7 @@ describe('runPublish — idempotence', () => {
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'race-lost', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'race-lost', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, error: null })
   })
 
@@ -249,15 +252,113 @@ describe('runPublish — idempotence', () => {
     state.beforeUpdate = (values) => {
       if (values.postedDate) {
         state.beforeUpdate = null
-        state.items.push({ id: 'z', status: 'posted', postedDate: TODAY, slotIndex: 0, position: 9 })
+        state.items.push({ id: 'z', status: 'posted', postedDate: TODAY, slotIndex: 600, position: 9 })
       }
     }
 
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'race-lost', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'race-lost', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, postedDate: null })
+  })
+})
+
+describe('runPublish — the owner edits the slot times after a post has gone out', () => {
+  /**
+   * The hazard Task 10 exists to close.
+   *
+   * A slot is identified in the database by (posted_date, slot_index), and the
+   * plan identified it by its POSITION in the settings array. Adding an earlier
+   * time renumbers every slot after it, so the slot that has already published
+   * today answers to a different number than the one it was claimed under — and
+   * the "is this slot filled?" read finds nothing.
+   *
+   * `validateSlots` is used to build the new array rather than a literal,
+   * because that is exactly what `saveSettings` writes to the row.
+   */
+  function seedDay() {
+    state.settings.push({
+      id: 1, slots: ['10:00', '14:00', '20:00'], timezone: 'Europe/Istanbul', hashtags: '',
+    })
+    seedItem({ id: 'a', position: 1 })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+  }
+
+  it('does not post again when an EARLIER slot is added minutes after the 10:00 post', async () => {
+    seedDay()
+    const first = await runPublish(AT_10_05)
+    expect(first.slots.map((s) => s.outcome)).toEqual(['posted'])
+    expect(itemRow('a').status).toBe('posted')
+
+    // 10:05: the owner adds a 09:00 slot. Under the plan's numbering, index 0
+    // is now 09:00 and index 1 is 10:00 — and nothing holds (today, 1).
+    state.settings[0].slots = validateSlots(['09:00', '10:00', '14:00', '20:00'])
+
+    const publish = spyClient()
+    const second = await runPublish(new Date('2026-08-10T07:06:00Z')) // 10:06 Istanbul
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(itemRow('b')).toMatchObject({ status: 'pending', postedDate: null, attempts: 0 })
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(1)
+    // 10:00 is still recognised as the slot that published; 09:00 is refused
+    // because the day has already had every post the schedule allows by 09:00.
+    expect(second.slots).toEqual([
+      { date: TODAY, index: 540, outcome: 'over-quota' },
+      { date: TODAY, index: 600, outcome: 'already-filled' },
+    ])
+  })
+
+  it('gives the day the NEW number of posts when the slot that published is removed', async () => {
+    seedDay()
+    await runPublish(AT_10_05)
+
+    // Removing 10:00 renumbers 14:00 to index 0 — the number today's post
+    // holds — so under the plan's numbering the 14:00 slot reads as filled and
+    // stays empty for good.
+    state.settings[0].slots = validateSlots(['14:00', '20:00'])
+
+    // The day is now scheduled for two posts and has already had one, so the
+    // next one is 20:00, not 14:00. This is the direction the guard errs in:
+    // one post later than the owner might expect on the day they edit the
+    // schedule, never one post more.
+    const atTwo = await runPublish(new Date('2026-08-10T11:05:00Z'))
+    expect(atTwo.slots).toEqual([{ date: TODAY, index: 840, outcome: 'over-quota' }])
+
+    const atEight = await runPublish(new Date('2026-08-10T17:05:00Z'))
+    expect(atEight.slots).toEqual([{ date: TODAY, index: 1200, outcome: 'posted', itemId: 'b' }])
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(2)
+  })
+
+  it('still publishes into a later slot the same day after the times change', async () => {
+    seedDay()
+    await runPublish(AT_10_05)
+    state.settings[0].slots = validateSlots(['09:00', '10:00', '14:00', '20:00'])
+
+    // 14:05 Istanbul: a slot that has NOT been used, and the day is allowed a
+    // second post by then. The guard must not turn into "one post per day".
+    const report = await runPublish(new Date('2026-08-10T11:05:00Z'))
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 840, outcome: 'posted', itemId: 'b' }])
+    expect(itemRow('b')).toMatchObject({ status: 'posted', slotIndex: 840 })
+  })
+
+  it('does not post again when the slot that published is MOVED later the same day', async () => {
+    seedDay()
+    await runPublish(AT_10_05)
+
+    // "10:00 was too early" — moved to 10:30, five minutes after it published.
+    state.settings[0].slots = validateSlots(['10:30', '14:00', '20:00'])
+
+    const publish = spyClient()
+    const report = await runPublish(new Date('2026-08-10T07:35:00Z')) // 10:35
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 630, outcome: 'over-quota' }])
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(1)
   })
 })
 
@@ -285,9 +386,9 @@ describe('runPublish — a post that has already happened is never undone', () =
 
     const report = await runPublish(AT_10_05)
 
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted', itemId: 'a' }])
     expect(itemRow()).toMatchObject({
-      status: 'posted', postedDate: TODAY, slotIndex: 0, attempts: 0, error: null,
+      status: 'posted', postedDate: TODAY, slotIndex: 600, attempts: 0, error: null,
     })
     expect(deleteImage).not.toHaveBeenCalled()
   })
@@ -331,8 +432,8 @@ describe('runPublish — a post that has already happened is never undone', () =
     const report = await runPublish(AT_10_05)
 
     expect(publish).toHaveBeenCalledTimes(1)
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted-unrecorded', itemId: 'a' }])
-    expect(itemRow()).toMatchObject({ postedDate: TODAY, slotIndex: 0, attempts: 0 })
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted-unrecorded', itemId: 'a' }])
+    expect(itemRow()).toMatchObject({ postedDate: TODAY, slotIndex: 600, attempts: 0 })
 
     // The next tick must not republish it: the claim excludes it from the
     // pending query and fills the slot.
@@ -340,7 +441,7 @@ describe('runPublish — a post that has already happened is never undone', () =
     const publish2 = spyClient()
     const second = await runPublish(new Date('2026-08-10T07:20:00Z'))
     expect(publish2).not.toHaveBeenCalled()
-    expect(second.slots).toEqual([{ date: TODAY, index: 0, outcome: 'already-filled' }])
+    expect(second.slots).toEqual([{ date: TODAY, index: 600, outcome: 'already-filled' }])
   })
 })
 
@@ -352,7 +453,7 @@ describe('runPublish — failures', () => {
 
     const report = await runPublish(AT_10_05)
 
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'error', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'error', itemId: 'a' }])
     expect(itemRow()).toMatchObject({
       status: 'pending', attempts: 1, postedDate: null, slotIndex: null,
       error: 'media container failed',
@@ -389,7 +490,7 @@ describe('runPublish — failures', () => {
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'claim-failed', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'claim-failed', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, postedDate: null })
   })
 
@@ -403,7 +504,7 @@ describe('runPublish — failures', () => {
     clientOverride.value = null
     const second = await runPublish(new Date('2026-08-10T07:20:00Z'))
 
-    expect(second.slots).toEqual([{ date: TODAY, index: 0, outcome: 'posted', itemId: 'a' }])
+    expect(second.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ status: 'posted', attempts: 1, error: null })
   })
 })
@@ -411,7 +512,7 @@ describe('runPublish — failures', () => {
 describe('runPublish — skips that cost no attempt', () => {
   it('reports an empty queue', async () => {
     const report = await runPublish(AT_10_05)
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'empty-queue' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'empty-queue' }])
   })
 
   it('reports a caption-less head item without claiming or counting it', async () => {
@@ -422,7 +523,7 @@ describe('runPublish — skips that cost no attempt', () => {
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'missing-caption', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'missing-caption', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ attempts: 0, postedDate: null, status: 'pending' })
   })
 
@@ -435,7 +536,7 @@ describe('runPublish — skips that cost no attempt', () => {
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'caption-too-long', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'caption-too-long', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ attempts: 0, status: 'pending' })
   })
 
@@ -449,7 +550,7 @@ describe('runPublish — skips that cost no attempt', () => {
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'invalid-payload', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'invalid-payload', itemId: 'a' }])
     expect(itemRow()).toMatchObject({ attempts: 0, status: 'pending', postedDate: null })
   })
 
@@ -463,7 +564,7 @@ describe('runPublish — skips that cost no attempt', () => {
     const report = await runPublish(AT_10_05)
 
     expect(publish).not.toHaveBeenCalled()
-    expect(report.slots).toEqual([{ date: TODAY, index: 0, outcome: 'missing-caption', itemId: 'a' }])
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'missing-caption', itemId: 'a' }])
   })
 })
 
@@ -480,7 +581,7 @@ describe('runPublish — two cron runs racing', () => {
     const outcomes = [first.slots[0].outcome, second.slots[0].outcome].sort()
     expect(outcomes).toEqual(['posted', 'race-lost'])
     expect(state.items.filter((r) => r.postedDate !== null)).toHaveLength(1)
-    expect(itemRow()).toMatchObject({ status: 'posted', slotIndex: 0, attempts: 0 })
+    expect(itemRow()).toMatchObject({ status: 'posted', slotIndex: 600, attempts: 0 })
   })
 
   it('fills the slot once when two runs start together on a two-item queue', async () => {

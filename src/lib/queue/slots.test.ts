@@ -1,6 +1,6 @@
 // src/lib/queue/slots.test.ts
 import { describe, it, expect } from 'vitest'
-import { slotAt, dueSlots, upcomingSlots } from './slots'
+import { slotAt, dueSlots, upcomingSlots, slotIndexFor } from './slots'
 
 const TZ = 'Europe/Istanbul'
 const SLOTS = ['10:00', '14:00', '20:00']
@@ -22,7 +22,7 @@ describe('dueSlots', () => {
   it('returns slots whose time has passed within the grace window', () => {
     const now = new Date('2026-08-08T11:05:00Z') // 14:05 Istanbul
     const due = dueSlots(now, SLOTS, TZ)
-    expect(due.map((s) => s.index)).toEqual([1])
+    expect(due.map((s) => s.index)).toEqual([slotIndexFor('14:00')])
   })
 
   it('excludes slots older than the grace window', () => {
@@ -44,10 +44,12 @@ describe('dueSlots', () => {
 describe('upcomingSlots', () => {
   it('fills the next free slots in order, skipping used ones', () => {
     const now = new Date('2026-08-08T06:00:00Z') // 09:00 Istanbul
-    const used = [{ date: '2026-08-08', index: 0, at: slotAt('2026-08-08', '10:00', TZ) }]
+    const used = [
+      { date: '2026-08-08', time: '10:00', index: slotIndexFor('10:00'), at: slotAt('2026-08-08', '10:00', TZ) },
+    ]
     const next = upcomingSlots(now, SLOTS, TZ, 3, used)
-    expect(next.map((s) => `${s.date}#${s.index}`)).toEqual([
-      '2026-08-08#1', '2026-08-08#2', '2026-08-09#0',
+    expect(next.map((s) => `${s.date}#${s.time}`)).toEqual([
+      '2026-08-08#14:00', '2026-08-08#20:00', '2026-08-09#10:00',
     ])
   })
 
@@ -59,8 +61,8 @@ describe('upcomingSlots', () => {
     expect(next[0].at.getTime()).toBeLessThan(next[1].at.getTime())
     expect(next[1].at.getTime()).toBeLessThan(next[2].at.getTime())
     // Also verify they are the correct slots in chronological order
-    expect(next.map((s) => `${s.date}#${s.index}`)).toEqual([
-      '2026-08-08#1', '2026-08-08#2', '2026-08-08#0',
+    expect(next.map((s) => `${s.date}#${s.time}`)).toEqual([
+      '2026-08-08#10:00', '2026-08-08#14:00', '2026-08-08#20:00',
     ])
   })
 })
@@ -80,6 +82,34 @@ describe('dueSlots - yesterday branch', () => {
     // Should return the slot from the previous calendar day
     expect(due).toHaveLength(1)
     expect(due[0].date).toBe('2026-08-08')
-    expect(due[0].index).toBe(0)
+    expect(due[0].index).toBe(slotIndexFor('23:30'))
+  })
+})
+
+describe('slotIndexFor — a slot is identified by its time, not by its place in the list', () => {
+  it('is the number of minutes since local midnight', () => {
+    expect(slotIndexFor('00:00')).toBe(0)
+    expect(slotIndexFor('10:00')).toBe(600)
+    expect(slotIndexFor('23:59')).toBe(1439)
+  })
+
+  it('gives two different times two different indices', () => {
+    const indices = SLOTS.map(slotIndexFor)
+    expect(new Set(indices).size).toBe(SLOTS.length)
+  })
+
+  it('does not renumber 10:00 when the owner adds, removes or reorders slots', () => {
+    // The whole double-post fix in one assertion. `items_slot_unique_idx` is on
+    // (posted_date, slot_index), so if this number moved when the settings
+    // array changed, a day that had already published under the old numbering
+    // would publish again under the new one.
+    const now = new Date('2026-08-08T05:00:00Z') // 08:00 Istanbul, before every slot
+    const indexOfTen = (slots: string[]) =>
+      upcomingSlots(now, slots, TZ, slots.length).find((s) => s.time === '10:00')!.index
+
+    expect(indexOfTen(['10:00', '14:00', '20:00'])).toBe(600)
+    expect(indexOfTen(['09:00', '10:00', '14:00', '20:00'])).toBe(600)
+    expect(indexOfTen(['10:00', '20:00'])).toBe(600)
+    expect(indexOfTen(['20:00', '14:00', '10:00'])).toBe(600)
   })
 })

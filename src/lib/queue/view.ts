@@ -14,7 +14,7 @@ import { localDate, upcomingSlots, type SlotRef } from './slots'
  * the Blob SDK.
  */
 
-export type ViewSettings = { slots: string[]; timezone: string }
+export type ViewSettings = { slots: string[]; timezone: string; hashtags: string }
 
 /**
  * The `settings` table's own column defaults. Repeated here rather than
@@ -24,7 +24,14 @@ export type ViewSettings = { slots: string[]; timezone: string }
 export const DEFAULT_VIEW_SETTINGS: ViewSettings = {
   slots: ['10:00', '14:00', '20:00'],
   timezone: 'Europe/Istanbul',
+  hashtags: '',
 }
+
+/**
+ * Mirrors `MAX_CAPTION_CHARS` in repo.ts and the limit `validate()` enforces —
+ * repeated for the same reason as the defaults above.
+ */
+export const MAX_CAPTION_CHARS = 2200
 
 const TIME_RE = /^([01][0-9]|2[0-3]):[0-5][0-9]$/
 
@@ -40,20 +47,22 @@ function isKnownTimeZone(tz: string): boolean {
 /**
  * Settings the page can render on, from whatever `/api/settings` returned.
  *
- * That route does not exist yet (Task 10 owns it), so the realistic inputs are
- * a 404 body, `undefined`, and — once it lands — a real row. A malformed slot
- * time makes `slotAt` produce an Invalid Date and a bad timezone makes it
- * throw, either of which would take the whole page down, so each field falls
- * back independently.
+ * The realistic inputs are a real row, `undefined` (the fetch failed), and an
+ * error body. A malformed slot time makes `slotAt` produce an Invalid Date and
+ * a bad timezone makes it throw, either of which would take the whole page
+ * down, so each field falls back independently.
  */
 export function resolveViewSettings(raw: unknown): ViewSettings {
   const row = (typeof raw === 'object' && raw !== null ? raw : {}) as {
     slots?: unknown
     timezone?: unknown
+    hashtags?: unknown
   }
   const slots = row.slots
   const timezone = row.timezone
+  const hashtags = row.hashtags
   return {
+    hashtags: typeof hashtags === 'string' ? hashtags : DEFAULT_VIEW_SETTINGS.hashtags,
     slots:
       Array.isArray(slots) &&
       slots.length > 0 &&
@@ -163,6 +172,42 @@ export function needsCaption(item: Pick<ViewItem, 'kind' | 'caption'>): boolean 
 }
 
 /**
+ * The caption as Instagram will see it. Mirrors `withHashtags` in publish.ts,
+ * which composes the string that is actually posted; that module cannot be
+ * imported here because it pulls the database and sharp into the browser bundle.
+ */
+export function composedCaption(caption: string, hashtags: string): string {
+  const tags = hashtags.trim()
+  const base = caption.trim()
+  if (!tags) return base
+  if (!base) return tags
+  return `${base}\n\n${tags}`
+}
+
+/**
+ * True when the fixed hashtag block pushes this caption past Instagram's 2200
+ * characters.
+ *
+ * `selectForSlot` stops the queue dead at such an item — exactly like a missing
+ * caption, and for the same reason: it never steps past the head. Until this
+ * existed the page could not see it, because `ViewSettings` carried no
+ * `hashtags` field, so the owner saw a caption comfortably under the limit in
+ * the editor and a queue that had silently stopped.
+ */
+export function captionTooLong(
+  item: Pick<ViewItem, 'caption'>, hashtags: string,
+): boolean {
+  return composedCaption(item.caption, hashtags).length > MAX_CAPTION_CHARS
+}
+
+/** Every reason `selectForSlot` refuses an item and leaves the slot empty. */
+export function blocksQueue(
+  item: Pick<ViewItem, 'kind' | 'caption'>, settings: ViewSettings,
+): boolean {
+  return needsCaption(item) || captionTooLong(item, settings.hashtags)
+}
+
+/**
  * True for the state Task 8 calls `posted-unrecorded`: Instagram accepted the
  * post but the row could not be updated to say so, leaving the slot claim
  * (`postedDate`/`slotIndex`) written while `status` is still `pending`.
@@ -195,7 +240,10 @@ const DAY_MS = 86_400_000
  * timezone round-trip to render exactly.
  */
 export function labelForSlot(slot: SlotRef, settings: ViewSettings, now: Date): string {
-  const time = settings.slots[slot.index] ?? ''
+  // From the slot itself, not `settings.slots[slot.index]`: `index` is now
+  // minutes-since-midnight (see slotIndexFor), so indexing the array with it
+  // would read past the end of a three-element list.
+  const time = slot.time
   const today = localDate(now, settings.timezone)
   const tomorrow = localDate(new Date(now.getTime() + DAY_MS), settings.timezone)
   if (slot.date === today) return `Bugün ${time}`.trim()
@@ -224,8 +272,9 @@ export function slotLabels(
   // An uncaptioned item does not yield its turn — selectForSlot leaves the slot
   // empty and finds the same item at the head on the next tick. So nothing
   // below it has a knowable time, and promising one would be a lie the owner
-  // acts on. Label up to the blockage and no further.
-  const blocked = waiting.findIndex(needsCaption)
+  // acts on. Label up to the blockage and no further. A caption the hashtag
+  // block pushes over 2200 characters blocks in exactly the same way.
+  const blocked = waiting.findIndex((i) => blocksQueue(i, settings))
   const schedulable = blocked === -1 ? waiting : waiting.slice(0, blocked + 1)
   const slots = upcomingSlots(now, settings.slots, settings.timezone, schedulable.length)
   const out = new Map<string, string>()
@@ -248,11 +297,19 @@ export type QueueStatus = {
   /** Uncaptioned items a slot would otherwise be spent on. */
   missingCaptions: number
   /**
-   * The head item, when it is uncaptioned. This is the state that matters:
+   * Items whose caption plus the FIXED HASHTAG BLOCK exceeds Instagram's 2200
+   * characters. Counted separately because the item looks fine in the editor —
+   * the characters that break it come from the settings screen.
+   */
+  captionsTooLong: number
+  /**
+   * The head item, when it cannot publish. This is the state that matters:
    * `selectForSlot` only ever looks at the head and deliberately never skips
-   * past it, so one uncaptioned card at position 1 stops every slot.
+   * past it, so one bad card at position 1 stops every slot.
    */
   headBlockedId: string | null
+  /** Why the head is blocked, so the banner can say the right sentence. */
+  headBlockedReason: 'missing-caption' | 'caption-too-long' | null
   /** Items Instagram already has but the database does not know about. */
   unrecordedIds: string[]
   /** Items that used all three attempts. */
@@ -262,11 +319,18 @@ export type QueueStatus = {
 export function queueStatus(items: ViewItem[], settings: ViewSettings): QueueStatus {
   const waiting = items.filter(awaitsSlot)
   const head = waiting[0]
+  const headReason: QueueStatus['headBlockedReason'] =
+    !head ? null
+      : needsCaption(head) ? 'missing-caption'
+        : captionTooLong(head, settings.hashtags) ? 'caption-too-long'
+          : null
   return {
     waiting: waiting.length,
     daysLeft: Math.floor(waiting.length / Math.max(settings.slots.length, 1)),
     missingCaptions: waiting.filter(needsCaption).length,
-    headBlockedId: head && needsCaption(head) ? head.id : null,
+    captionsTooLong: waiting.filter((i) => captionTooLong(i, settings.hashtags)).length,
+    headBlockedId: headReason ? head.id : null,
+    headBlockedReason: headReason,
     unrecordedIds: items.filter(isUnrecorded).map((i) => i.id),
     failedIds: items.filter((i) => i.status === 'failed').map((i) => i.id),
   }

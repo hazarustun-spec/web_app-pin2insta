@@ -68,9 +68,8 @@ export function QueueClient({
     try {
       const [itemsRes, settingsRes] = await Promise.all([
         fetch('/api/items'),
-        // Task 10 owns /api/settings and it does not exist yet, so this 404s
-        // today. Swallowed on purpose: an unhandled r.json() here would take
-        // down a page that is otherwise working perfectly well on defaults.
+        // Swallowed on purpose: an unhandled r.json() here would take down a
+        // page that is otherwise working perfectly well on defaults.
         fetch('/api/settings').catch(() => null),
       ])
       if (itemsRes.status === 401) {
@@ -278,8 +277,9 @@ export function QueueClient({
       </header>
 
       <QueueBanner
-        headBlocked={status.headBlockedId !== null}
+        headBlockedReason={status.headBlockedReason}
         missingCaptions={status.missingCaptions}
+        captionsTooLong={status.captionsTooLong}
         unrecorded={status.unrecordedIds.length}
         failed={status.failedIds.length}
         daysLeft={status.daysLeft}

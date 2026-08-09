@@ -22,8 +22,9 @@ function Alarm({ children }: { children: React.ReactNode }) {
  *   permanently invisible to the publisher.
  */
 export function QueueBanner({
-  headBlocked,
+  headBlockedReason,
   missingCaptions,
+  captionsTooLong,
   unrecorded,
   failed,
   daysLeft,
@@ -31,8 +32,9 @@ export function QueueBanner({
   notes,
   onDismissNotes,
 }: {
-  headBlocked: boolean
+  headBlockedReason: 'missing-caption' | 'caption-too-long' | null
   missingCaptions: number
+  captionsTooLong: number
   unrecorded: number
   failed: number
   daysLeft: number
@@ -40,12 +42,24 @@ export function QueueBanner({
   notes: Note[]
   onDismissNotes: () => void
 }) {
+  const headBlocked = headBlockedReason !== null
   return (
     <>
-      {headBlocked && (
+      {headBlockedReason === 'missing-caption' && (
         <Alarm>
           Sıradaki gönderinin açıklaması yok — <strong>kuyruk durdu</strong>. Sıra atlanmaz, bu
           gönderiye açıklama yazılana kadar hiçbir gönderi paylaşılmaz.
+        </Alarm>
+      )}
+      {headBlockedReason === 'caption-too-long' && (
+        // The characters that broke it may not be in the caption at all: the
+        // fixed hashtag block from the settings screen is appended to every
+        // post and counts towards the same 2200.
+        <Alarm>
+          Sıradaki gönderinin açıklaması, sabit hashtag&apos;lerle birlikte 2200 karakteri aşıyor —{' '}
+          <strong>kuyruk durdu</strong>. Açıklamayı kısaltın veya{' '}
+          <a href="/settings" className="underline underline-offset-4">ayarlardan</a>{' '}
+          hashtag&apos;leri azaltın.
         </Alarm>
       )}
       {unrecorded > 0 && (
@@ -65,6 +79,12 @@ export function QueueBanner({
         <Alarm>
           {missingCaptions} gönderinin açıklaması eksik — sırası gelince kuyruk orada duracak,
           sonrakiler paylaşılmayacak.
+        </Alarm>
+      )}
+      {captionsTooLong > 0 && headBlockedReason !== 'caption-too-long' && (
+        <Alarm>
+          {captionsTooLong} gönderinin açıklaması sabit hashtag&apos;lerle birlikte 2200 karakteri
+          aşıyor — sırası gelince kuyruk orada duracak.
         </Alarm>
       )}
       {waiting > 0 && daysLeft < 3 && (

@@ -10,6 +10,8 @@ import {
   labelForSlot,
   slotLabels,
   queueStatus,
+  composedCaption,
+  captionTooLong,
   nextCaptionlessId,
   moveId,
   describeUploadResults,
@@ -25,7 +27,9 @@ import { upcomingSlots } from './slots'
 /** The exact regex `app/api/blob/upload/route.ts` answers 400 for. */
 const STAGING_PATH = /^tmp\/[A-Za-z0-9._-]{1,160}$/
 
-const SETTINGS: ViewSettings = { slots: ['10:00', '14:00', '20:00'], timezone: 'Europe/Istanbul' }
+const SETTINGS: ViewSettings = {
+  slots: ['10:00', '14:00', '20:00'], timezone: 'Europe/Istanbul', hashtags: '',
+}
 
 function item(over: Partial<ViewItem> & { id: string }): ViewItem {
   return {
@@ -42,24 +46,26 @@ function item(over: Partial<ViewItem> & { id: string }): ViewItem {
 }
 
 describe('resolveViewSettings', () => {
-  it('falls back to the schema defaults when /api/settings does not exist yet', () => {
-    // Task 10 owns the route; until then the fetch 404s and this is what the
-    // page has to render on.
+  it('falls back to the schema defaults when /api/settings answers nothing usable', () => {
+    // A failed fetch, or a database whose settings row has never been written:
+    // this is what the page has to render on.
     expect(resolveViewSettings(undefined)).toEqual(DEFAULT_VIEW_SETTINGS)
     expect(resolveViewSettings(null)).toEqual(DEFAULT_VIEW_SETTINGS)
     expect(resolveViewSettings({ error: 'not found' })).toEqual(DEFAULT_VIEW_SETTINGS)
   })
 
   it('keeps a valid row', () => {
-    expect(resolveViewSettings({ slots: ['08:30', '21:45'], timezone: 'Europe/Berlin' }))
-      .toEqual({ slots: ['08:30', '21:45'], timezone: 'Europe/Berlin' })
+    expect(resolveViewSettings({ slots: ['08:30', '21:45'], timezone: 'Europe/Berlin', hashtags: '#a' }))
+      .toEqual({ slots: ['08:30', '21:45'], timezone: 'Europe/Berlin', hashtags: '#a' })
   })
 
   it('rejects each bad field on its own', () => {
     expect(resolveViewSettings({ slots: ['25:00'], timezone: 'Europe/Berlin' }))
-      .toEqual({ slots: DEFAULT_VIEW_SETTINGS.slots, timezone: 'Europe/Berlin' })
+      .toEqual({ slots: DEFAULT_VIEW_SETTINGS.slots, timezone: 'Europe/Berlin', hashtags: '' })
     expect(resolveViewSettings({ slots: [], timezone: 'Mars/Olympus' }))
       .toEqual(DEFAULT_VIEW_SETTINGS)
+    expect(resolveViewSettings({ slots: ['10:00'], timezone: 'Europe/Istanbul', hashtags: 7 }).hashtags)
+      .toBe('')
     expect(resolveViewSettings({ slots: ['10:00', 7], timezone: 'Europe/Istanbul' }).slots)
       .toEqual(DEFAULT_VIEW_SETTINGS.slots)
   })
@@ -358,5 +364,62 @@ describe('describeUploadResults', () => {
     expect(notes).toHaveLength(11)
     expect(notes[0]).toEqual({ tone: 'error', text: 'e0.jpg: yüklenemedi' })
     expect(notes[10]).toEqual({ tone: 'error', text: 've 2 dosya daha yüklenemedi' })
+  })
+})
+
+describe('the fixed hashtag block is part of what the page can see', () => {
+  const TAGS = '#moda #stil'
+  const withTags: ViewSettings = { ...SETTINGS, hashtags: TAGS }
+  // withHashtags joins with a blank line, so this composes to exactly 2200.
+  const exact = 'x'.repeat(2200 - TAGS.length - 2)
+
+  it('composes the caption exactly as the publisher does', () => {
+    expect(composedCaption('bir açıklama', TAGS)).toBe(`bir açıklama\n\n${TAGS}`)
+    expect(composedCaption('  ', TAGS)).toBe(TAGS)
+    expect(composedCaption('bir açıklama', '   ')).toBe('bir açıklama')
+  })
+
+  it('measures the caption with the hashtags, not without them', () => {
+    expect(captionTooLong({ caption: exact }, TAGS)).toBe(false)
+    expect(captionTooLong({ caption: `${exact}x` }, TAGS)).toBe(true)
+    // The same caption is fine with no hashtag block configured.
+    expect(captionTooLong({ caption: `${exact}x` }, '')).toBe(false)
+  })
+
+  it('names a too-long head as a blockage of its own kind', () => {
+    const s = queueStatus([item({ id: 'head', caption: `${exact}x` }), item({ id: 'b' })], withTags)
+    expect(s.headBlockedId).toBe('head')
+    expect(s.headBlockedReason).toBe('caption-too-long')
+    expect(s.missingCaptions).toBe(0)
+    expect(s.captionsTooLong).toBe(1)
+  })
+
+  it('still calls a missing caption a missing caption', () => {
+    const s = queueStatus([item({ id: 'head', caption: '' })], withTags)
+    expect(s.headBlockedReason).toBe('missing-caption')
+  })
+
+  it('reports no blockage when nothing is wrong', () => {
+    const s = queueStatus([item({ id: 'a' })], withTags)
+    expect(s.headBlockedReason).toBe(null)
+    expect(s.headBlockedId).toBe(null)
+    expect(s.captionsTooLong).toBe(0)
+  })
+
+  it('labels nothing at or below an item the hashtags push over the limit', () => {
+    // Exactly the state Task 9 could not see: the queue stops here, and the
+    // characters that stopped it came from the settings screen.
+    const items = [
+      item({ id: 'a' }),
+      item({ id: 'blocker', caption: `${exact}x` }),
+      item({ id: 'c' }),
+    ]
+    const now = new Date('2026-08-09T05:00:00Z')
+    const labels = slotLabels(items, withTags, now)
+    expect(labels.get('a')).toBe('Bugün 10:00')
+    expect(labels.has('blocker')).toBe(false)
+    expect(labels.has('c')).toBe(false)
+    // The same queue with no hashtags configured runs to the end.
+    expect([...slotLabels(items, SETTINGS, now).keys()]).toEqual(['a', 'blocker', 'c'])
   })
 })

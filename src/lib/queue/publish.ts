@@ -8,7 +8,7 @@ import {
 } from '@/src/lib/instagram/types'
 import { makeThumb } from '@/src/lib/images/process'
 import { uploadImage, deleteImage } from '@/src/lib/images/storage'
-import { dueSlots, type SlotRef } from './slots'
+import { dueSlots, slotIndexFor, type SlotRef } from './slots'
 import { MAX_CAPTION_CHARS } from './repo'
 
 /** Retries per item before it is marked `failed` and stops blocking the queue. */
@@ -87,7 +87,13 @@ export const DEFAULT_SETTINGS: SchedulerSettings = {
 
 const TIME_RE = /^([01][0-9]|2[0-3]):[0-5][0-9]$/
 
-function isKnownTimeZone(tz: string): boolean {
+/**
+ * Exported so the settings screen refuses a zone with the SAME test the
+ * scheduler runs on. A second implementation would be free to drift, and the
+ * cost of the drift is a schedule that silently shifts (or a cron run that
+ * throws) hours after the owner typed it.
+ */
+export function isKnownTimeZone(tz: string): boolean {
   try {
     new Intl.DateTimeFormat('en-CA', { timeZone: tz })
     return true
@@ -152,6 +158,8 @@ export type SlotOutcome =
   /** Instagram accepted the post but the row could not be updated to say so. */
   | 'posted-unrecorded'
   | 'already-filled'
+  /** The day has already had every post the schedule allows by this time — see `allowanceBy`. */
+  | 'over-quota'
   | 'race-lost'
   | 'claim-failed'
   | 'invalid-payload'
@@ -213,6 +221,35 @@ async function recordFailure(db: Db, item: Candidate, e: unknown): Promise<void>
     .where(eq(items.id, item.id))
 }
 
+/**
+ * How many posts the schedule allows a day to have made by `time`: the number
+ * of configured slots at or before it.
+ *
+ * The second half of the double-post fix, and the half that covers the case
+ * minute-of-day identity cannot. Once the times can be edited mid-day, a slot
+ * can appear in the PAST: add 09:00 at 10:05 and `dueSlots`' 90-minute grace
+ * window reports 09:00 as due right now, so a post goes out six minutes after
+ * the 10:00 one. Moving 10:00 to 10:30 after it has published does the same.
+ * Neither is a duplicate row, and the unique index has nothing to say about
+ * either; both are two posts half an hour apart on an account that is supposed
+ * to post three times a day.
+ *
+ * The rule this expresses is one sentence: A DAY NEVER GETS MORE POSTS THAN THE
+ * SCHEDULE ALLOWS BY THAT TIME OF DAY. It is deliberately conservative. On the
+ * day the owner edits the schedule it can cost a post — reduce three slots to
+ * two after the first has gone out and the day publishes at 10:00 and 20:00
+ * rather than at 10:00, 14:00 and 20:00 — and that is the direction to err in:
+ * a late post is a nuisance, an unplanned extra post is an account risk and
+ * cannot be taken back.
+ *
+ * It changes nothing about an ordinary day: by the Nth slot exactly N-1 posts
+ * have gone out, so the allowance is never binding.
+ */
+export function allowanceBy(slots: string[], time: string): number {
+  const limit = slotIndexFor(time)
+  return slots.filter((s) => slotIndexFor(s) <= limit).length
+}
+
 async function runSlot(
   db: Db,
   client: InstagramClient,
@@ -226,9 +263,15 @@ async function runSlot(
       ? { date: slot.date, index: slot.index, outcome }
       : { date: slot.date, index: slot.index, outcome, itemId }
 
-  const filled = await db.select({ id: items.id }).from(items)
-    .where(and(eq(items.postedDate, slot.date), eq(items.slotIndex, slot.index)))
-  if (filled.length > 0) return at('already-filled')
+  // One read answers both questions: has THIS slot published, and has the day
+  // already had everything the schedule allows by now?
+  const claims = await db.select({ slotIndex: items.slotIndex }).from(items)
+    .where(eq(items.postedDate, slot.date))
+  const used = claims
+    .map((r) => r.slotIndex)
+    .filter((i): i is number => typeof i === 'number')
+  if (used.includes(slot.index)) return at('already-filled')
+  if (used.length >= allowanceBy(cfg.slots, slot.time)) return at('over-quota')
 
   // Exactly the columns selectForSlot needs, so real rows satisfy `Candidate`
   // without a cast. The ordering is total (position ties are possible, because
