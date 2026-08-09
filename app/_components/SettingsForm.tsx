@@ -180,8 +180,8 @@ export function SettingsForm({
         </Hint>
         <Hint>
           Saatleri değiştirmek bugün paylaşılanları etkilemez: bir gün, o saate kadar programın
-          izin verdiğinden fazla gönderi paylaşamaz. Saati geçmiş yeni bir slot bugün için
-          çalışmaz — yarından itibaren geçerli olur.
+          izin verdiğinden fazla gönderi paylaşamaz. Saati geçmiş yeni bir slot, ancak günün
+          kontenjanı dolmadıysa çalışır.
         </Hint>
       </section>
 

@@ -64,8 +64,9 @@ export function QueueBanner({
       )}
       {unrecorded > 0 && (
         <Alarm>
-          {unrecorded} gönderi Instagram&apos;a gitti ama kaydedilemedi. Kuyrukta duruyor, bir daha
-          paylaşılmayacak — Instagram&apos;da kontrol edip silin.
+          {unrecorded} gönderi Instagram&apos;a gitti ama kaydedilemedi. Kuyrukta duruyor ve
+          slotunu tuttuğu için tekrar paylaşılmaz. Instagram&apos;da kontrol edin — silecekseniz
+          o slotun saati geçtikten sonra silin, yoksa aynı slota yeni bir gönderi girer.
         </Alarm>
       )}
       {failed > 0 && (

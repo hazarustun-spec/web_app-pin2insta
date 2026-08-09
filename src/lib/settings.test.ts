@@ -194,6 +194,24 @@ describe('validateHashtags', () => {
     expect(() => validateHashtags(long)).toThrow(`en fazla ${MAX_HASHTAG_CHARS} karakter`)
   })
 
+  it('accepts a block that lands exactly on the character ceiling', () => {
+    // The ceiling is inclusive; only the character past it is refused. Without
+    // a case sitting on the boundary, > and >= are indistinguishable.
+    // Built from legal tags — a single tag long enough to hit the ceiling
+    // would trip the per-tag limit first and test nothing.
+    const tags = Array.from({ length: 7 }, (_, i) => `#${'a'.repeat(80)}${i}`)
+    const joined = tags.join(' ')
+    const exact = `${joined} #${'b'.repeat(MAX_HASHTAG_CHARS - joined.length - 2)}`
+    expect(exact).toHaveLength(MAX_HASHTAG_CHARS)
+    expect(validateHashtags(exact)).toBe(exact)
+    expect(() => validateHashtags(`${exact}a`)).toThrow(`en fazla ${MAX_HASHTAG_CHARS} karakter`)
+  })
+
+  it('drops a bare hash left behind by deleting a tag body', () => {
+    expect(validateHashtags('#one # #two')).toBe('#one #two')
+    expect(validateHashtags('#')).toBe('')
+  })
+
   it('rejects one absurdly long tag', () => {
     expect(() => validateHashtags(`#${'a'.repeat(101)}`)).toThrow('geçersiz hashtag')
     expect(validateHashtags(`#${'a'.repeat(100)}`)).toBe(`#${'a'.repeat(100)}`)
