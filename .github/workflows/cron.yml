@@ -1,0 +1,48 @@
+name: pin2insta cron
+
+# The scheduler, living outside the app. Vercel's Hobby plan only fires a cron
+# once a day, which cannot serve three posting slots, so GitHub Actions calls
+# the app instead. Both endpoints are POST-only and authenticate with
+# CRON_SECRET; nothing else guards them, because /api/cron/* is deliberately
+# excluded from the session proxy.
+on:
+  schedule:
+    # Every 15 minutes. GitHub's scheduler drifts under load and can be several
+    # minutes late — dueSlots carries a 90-minute grace window to absorb that,
+    # and the (posted_date, slot_index) unique index makes an overlapping run
+    # harmless.
+    - cron: '*/15 * * * *'
+    # Insights are free and change slowly; four times a day is plenty. The odd
+    # minute keeps it off the crowded top of the hour.
+    - cron: '17 */6 * * *'
+  # Both jobs are manually runnable. Publishing is safe to trigger by hand: an
+  # already-filled slot answers 'already-filled' rather than posting twice.
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run'
+        required: true
+        default: publish
+        type: choice
+        options: [publish, insights]
+
+jobs:
+  publish:
+    if: github.event.schedule == '*/15 * * * *' || inputs.job == 'publish'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger publish
+        run: |
+          curl -sS -X POST "${{ secrets.APP_URL }}/api/cron/publish" \
+            -H "authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            --fail-with-body --max-time 300
+
+  insights:
+    if: github.event.schedule == '17 */6 * * *' || inputs.job == 'insights'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refresh insights
+        run: |
+          curl -sS -X POST "${{ secrets.APP_URL }}/api/cron/insights" \
+            -H "authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            --fail-with-body --max-time 300
