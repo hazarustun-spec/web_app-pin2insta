@@ -14,6 +14,8 @@ const MAX_FILE_BYTES = 4 * 1024 * 1024
 // req.formData() has already buffered every part by then — rejecting mid-loop
 // would let 200 files sit in memory while we politely skip 150 of them.
 const MAX_BATCH_FILES = 50
+// Filenames are echoed back to label result rows and nothing more.
+const MAX_NAME_CHARS = 200
 // Ceiling on the whole multipart body, checked from Content-Length before
 // formData() reads anything.
 //
@@ -44,11 +46,17 @@ function parseStaged(body: unknown): StagedUpload[] | null {
   const uploads = (body as { uploads?: unknown }).uploads
   if (!Array.isArray(uploads)) return null
   const out: StagedUpload[] = []
+  const seen = new Set<string>()
   for (const u of uploads) {
     if (typeof u !== 'object' || u === null) return null
     const { url, name } = u as { url?: unknown; name?: unknown }
     if (typeof url !== 'string' || typeof name !== 'string') return null
-    out.push({ url, name })
+    // A double-submitted URL would ingest once and then report "not found" for
+    // the second copy, because the first ingest deletes the staged object.
+    if (seen.has(url)) continue
+    seen.add(url)
+    // The name is only ever echoed back to label a result row.
+    out.push({ url, name: name.slice(0, MAX_NAME_CHARS) })
   }
   return out
 }
@@ -108,9 +116,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'istek çok büyük' }, { status: 413 })
   }
 
-  // Next's proxy layer truncates a body over proxyClientMaxBodySize rather than
-  // rejecting it, which makes formData() throw on a partial multipart stream.
-  // Uncaught, that is a 500 with no results array at all.
+  // Next's proxy layer truncates a body over its own limit (10MB by default;
+  // no proxyClientMaxBodySize is configured) rather than rejecting it, which
+  // makes formData() throw on a partial multipart stream. Uncaught, that is a
+  // 500 with no results array at all.
   let form: FormData
   try {
     form = await req.formData()

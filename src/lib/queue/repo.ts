@@ -39,10 +39,21 @@ function isDuplicateHashViolation(e: unknown): boolean {
   return err?.code === '23505' && err?.constraint === 'images_hash_unique_idx'
 }
 
-/** Hostname suffix of every Vercel Blob public store. */
-const BLOB_HOST_SUFFIX = '.public.blob.vercel-storage.com'
 /** Mirrors the token route's maximumSizeInBytes — nothing larger can have been staged. */
 const MAX_STAGED_BYTES = 25 * 1024 * 1024
+/** A staged object never takes this long to fetch; without it 50 slow URLs can hold the function to its full maxDuration. */
+const STAGED_FETCH_TIMEOUT_MS = 30_000
+
+/**
+ * Hostname of OUR blob store, derived from the read-write token.
+ * `vercel_blob_rw_<storeId>_<secret>` — the store id is the fourth field, and
+ * public objects live at `https://<storeId>.public.blob.vercel-storage.com/`.
+ * Returns null when unset, which makes the guard below fail closed.
+ */
+export function stagedBlobHost(): string | null {
+  const storeId = process.env.BLOB_READ_WRITE_TOKEN?.split('_')[3]
+  return storeId ? `${storeId}.public.blob.vercel-storage.com` : null
+}
 
 /**
  * True only for a URL that our own client-upload route could have produced.
@@ -51,8 +62,18 @@ const MAX_STAGED_BYTES = 25 * 1024 * 1024
  * route is a server-side request forgery primitive: an internal address, a
  * cloud metadata endpoint, or a file on the deploy host, fetched with the
  * server's network position and reported back through the ingest result.
+ *
+ * The host is matched exactly, not by suffix: `*.public.blob.vercel-storage.com`
+ * is every Vercel customer's public store, and the store id is recoverable from
+ * a token by anyone holding one. The path is matched whole rather than by
+ * prefix, because `new URL()` leaves `%2f` encoded — `/tmp/..%2fqueue/x.jpg`
+ * starts with `/tmp/` here but may resolve elsewhere at the CDN, and
+ * ingestFromUrl deletes whatever it fetched.
  */
-export function isStagedBlobUrl(raw: string): boolean {
+const STAGED_PATH = /^\/tmp\/[A-Za-z0-9._-]{1,200}$/
+
+export function isStagedBlobUrl(raw: string, expectedHost: string | null): boolean {
+  if (!expectedHost) return false
   let u: URL
   try {
     u = new URL(raw)
@@ -60,11 +81,43 @@ export function isStagedBlobUrl(raw: string): boolean {
     return false
   }
   if (u.protocol !== 'https:') return false
-  if (!u.hostname.endsWith(BLOB_HOST_SUFFIX)) return false
-  // Reject a hostname that is only the suffix, so a registered
-  // "public.blob.vercel-storage.com" style host cannot match.
-  if (u.hostname.length <= BLOB_HOST_SUFFIX.length) return false
-  return u.pathname.startsWith('/tmp/')
+  if (u.hostname !== expectedHost) return false
+  // A credentialed or port-bearing URL passes a hostname check but means
+  // something different to fetch() than it does here. Refuse the disagreement.
+  if (u.username || u.password || u.port) return false
+  if (u.search || u.hash) return false
+  return STAGED_PATH.test(u.pathname)
+}
+
+/**
+ * Read a response body, stopping as soon as it exceeds `limit`.
+ *
+ * res.arrayBuffer() would buffer the whole body first and only then let us
+ * measure it, so a Content-Length check is no protection at all: the header is
+ * advisory, and absent on a chunked response, where `Number(null)` is 0 and any
+ * `declared > limit` test silently passes. Counting as we go is the only bound
+ * that holds when the sender is not cooperating.
+ */
+async function readCapped(res: Response, limit: number): Promise<Buffer> {
+  if (!res.body) throw new IngestError('yüklenen görsel bulunamadı')
+  const chunks: Buffer[] = []
+  let total = 0
+  const reader = res.body.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > limit) {
+        throw new IngestError('dosya çok büyük — en fazla 25MB olmalı')
+      }
+      chunks.push(Buffer.from(value))
+    }
+  } finally {
+    // Releases the socket when we bailed out early.
+    await reader.cancel().catch(() => {})
+  }
+  return Buffer.concat(chunks)
 }
 
 /**
@@ -73,20 +126,18 @@ export function isStagedBlobUrl(raw: string): boolean {
  * request-body cap — which is any drop of more than about one photo.
  */
 export async function ingestFromUrl(url: string, name: string) {
-  if (!isStagedBlobUrl(url)) throw new IngestError('geçersiz yükleme adresi')
+  if (!isStagedBlobUrl(url, stagedBlobHost())) throw new IngestError('geçersiz yükleme adresi')
 
-  const res = await fetch(url)
+  // redirect: 'error' — the guard above validated the URL we asked for, and
+  // nothing re-checks where a 3xx would send us. Following one would hand an
+  // arbitrary host the function's network position.
+  const res = await fetch(url, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(STAGED_FETCH_TIMEOUT_MS),
+  })
   if (!res.ok) throw new IngestError('yüklenen görsel bulunamadı')
 
-  const declared = Number(res.headers.get('content-length'))
-  if (Number.isFinite(declared) && declared > MAX_STAGED_BYTES) {
-    throw new IngestError('dosya çok büyük — en fazla 25MB olmalı')
-  }
-  const buf = Buffer.from(await res.arrayBuffer())
-  // Content-Length is advisory; the delivered body is what costs memory.
-  if (buf.byteLength > MAX_STAGED_BYTES) {
-    throw new IngestError('dosya çok büyük — en fazla 25MB olmalı')
-  }
+  const buf = await readCapped(res, MAX_STAGED_BYTES)
 
   try {
     return await ingestBuffer(buf, name)

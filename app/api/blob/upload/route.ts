@@ -23,6 +23,14 @@ const ALLOWED_CONTENT_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/a
 // Generous next to any real photo, and far below Blob's own ceiling. Bounds
 // what a leaked token could write, and what ingestFromUrl will later download.
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+/**
+ * The pathname is chosen by the caller and signed into the token verbatim, so
+ * it is the one field that decides where the write lands. Unvalidated, a client
+ * can stage into `queue/` — a namespace ingestFromUrl refuses to touch, so the
+ * object would never be fetched, never be deleted, and bill forever.
+ * Must stay in step with STAGED_PATH in src/lib/queue/repo.ts.
+ */
+const STAGING_PATH = /^tmp\/[A-Za-z0-9._-]{1,200}$/
 
 export async function POST(req: Request): Promise<NextResponse> {
   // proxy.ts already guards this path, but a token minted here can write to the
@@ -36,24 +44,31 @@ export async function POST(req: Request): Promise<NextResponse> {
     return NextResponse.json({ error: 'unauthorised' }, { status: 401 })
   }
 
-  const body = (await req.json()) as HandleUploadBody
-
   try {
+    const body = (await req.json()) as HandleUploadBody
+
     const result = await handleUpload({
       body,
       request: req,
-      onBeforeGenerateToken: async () => ({
-        allowedContentTypes: ALLOWED_CONTENT_TYPES,
-        maximumSizeInBytes: MAX_UPLOAD_BYTES,
-        // Two drops of the same file must not collide, and these are temporary
-        // staging objects — the content-addressed key is assigned later, by
-        // ingestFromUrl, once the bytes have actually been cropped.
-        addRandomSuffix: true,
-      }),
-      // Deliberately no onUploadCompleted: it does not fire on localhost, and
-      // the client posts the URLs to /api/items itself. Nothing is enqueued
-      // until that authenticated call arrives.
-      onUploadCompleted: async () => {},
+      onBeforeGenerateToken: async (pathname) => {
+        // Throwing here is caught below and answered as 400 — no token minted.
+        if (!STAGING_PATH.test(pathname)) throw new Error('bad staging pathname')
+        return {
+          allowedContentTypes: ALLOWED_CONTENT_TYPES,
+          maximumSizeInBytes: MAX_UPLOAD_BYTES,
+          // Two drops of the same file must not collide, and these are
+          // temporary staging objects — the content-addressed key is assigned
+          // later, by ingestFromUrl, once the bytes have been cropped.
+          addRandomSuffix: true,
+        }
+      },
+      // NOTE: onUploadCompleted is omitted, not stubbed. Passing even an empty
+      // function makes handleUpload sign a callbackUrl into the token whenever
+      // it can resolve one — which it can on Vercel, though never on localhost.
+      // Blob would then call this route server-to-server with no session
+      // cookie, and the auth gate above would 401 every single upload: broken
+      // in production, perfect in dev. The client posts the URLs to /api/items
+      // itself, so no callback is wanted.
     })
     return NextResponse.json(result)
   } catch (e) {

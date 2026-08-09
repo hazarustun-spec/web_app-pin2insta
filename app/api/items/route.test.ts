@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const ingestBuffer = vi.hoisted(() => vi.fn())
+const ingestFromUrl = vi.hoisted(() => vi.fn())
 vi.mock('@/src/lib/queue/repo', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/src/lib/queue/repo')>()),
   ingestBuffer,
+  ingestFromUrl,
   listQueue: vi.fn(async () => []),
 }))
 
@@ -91,5 +93,111 @@ describe('POST /api/items validation', () => {
       'error',
       'added',
     ])
+  })
+})
+
+function jsonReq(body: unknown) {
+  return new Request('http://localhost/api/items', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  })
+}
+
+const HOST = 'teststore.public.blob.vercel-storage.com'
+const staged = (n: number) => `https://${HOST}/tmp/f${n}-abc.jpg`
+
+describe('POST /api/items staged uploads', () => {
+  beforeEach(() => {
+    ingestFromUrl.mockReset()
+    ingestFromUrl.mockImplementation(async (_url: string, name: string) => ({
+      status: 'added' as const,
+      itemId: `id-${name}`,
+      name,
+    }))
+  })
+
+  it('ingests staged blob URLs posted as JSON', async () => {
+    const res = await POST(jsonReq({ uploads: [{ url: staged(1), name: 'a.jpg' }] }))
+    expect(res.status).toBe(200)
+    expect((await res.json()).results[0]).toMatchObject({ status: 'added', name: 'a.jpg' })
+    expect(ingestFromUrl).toHaveBeenCalledWith(staged(1), 'a.jpg')
+  })
+
+  it('routes to the staged branch even when the content type carries a charset', async () => {
+    const res = await POST(
+      new Request('http://localhost/api/items', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ uploads: [{ url: staged(1), name: 'a.jpg' }] }),
+      }),
+    )
+    expect(res.status).toBe(200)
+    expect(ingestFromUrl).toHaveBeenCalledTimes(1)
+  })
+
+  it('caps a staged batch before ingesting any of it', async () => {
+    const uploads = Array.from({ length: 51 }, (_, i) => ({ url: staged(i), name: `f${i}.jpg` }))
+    const res = await POST(jsonReq({ uploads }))
+    expect(res.status).toBe(413)
+    expect(ingestFromUrl).not.toHaveBeenCalled()
+  })
+
+  // The first ingest deletes the staged object, so a repeated URL would report
+  // 'not found' for the second copy rather than being a harmless no-op.
+  it('ingests a repeated URL only once', async () => {
+    const u = staged(1)
+    const res = await POST(
+      jsonReq({ uploads: [{ url: u, name: 'a.jpg' }, { url: u, name: 'a.jpg' }] }),
+    )
+    expect(res.status).toBe(200)
+    expect(ingestFromUrl).toHaveBeenCalledTimes(1)
+  })
+
+  it('truncates an absurd filename rather than echoing it back', async () => {
+    const res = await POST(
+      jsonReq({ uploads: [{ url: staged(1), name: 'x'.repeat(5000) }] }),
+    )
+    expect(res.status).toBe(200)
+    expect(ingestFromUrl.mock.calls[0][1].length).toBe(200)
+  })
+
+  it.each([
+    ['uploads missing', {}],
+    ['uploads not an array', { uploads: 'nope' }],
+    ['a null entry', { uploads: [null] }],
+    ['a non-string url', { uploads: [{ url: 1, name: 'a' }] }],
+    ['a missing name', { uploads: [{ url: staged(1) }] }],
+    ['a top-level array', [{ url: staged(1), name: 'a' }]],
+    ['null', null],
+    ['malformed json', '{'],
+  ])('rejects %s without ingesting anything', async (_label, body) => {
+    const res = await POST(jsonReq(body))
+    expect(res.status).toBe(400)
+    expect(ingestFromUrl).not.toHaveBeenCalled()
+  })
+
+  it('reports an empty upload list as a bad request', async () => {
+    const res = await POST(jsonReq({ uploads: [] }))
+    expect(res.status).toBe(400)
+  })
+
+  it('lets one staged failure stand alone in its batch', async () => {
+    ingestFromUrl.mockImplementation(async (_url: string, name: string) => {
+      if (name === 'bad.jpg') throw new Error('internal detail: postgres://user:pw@host')
+      return { status: 'added' as const, itemId: `id-${name}`, name }
+    })
+    const res = await POST(
+      jsonReq({
+        uploads: [
+          { url: staged(1), name: 'good1.jpg' },
+          { url: staged(2), name: 'bad.jpg' },
+          { url: staged(3), name: 'good2.jpg' },
+        ],
+      }),
+    )
+    const body = await res.json()
+    expect(body.results.map((r: { status: string }) => r.status)).toEqual(['added', 'error', 'added'])
+    expect(body.results[1].message).toBe('yüklenemedi')
   })
 })

@@ -173,6 +173,21 @@ describe('cropTo45', () => {
     expect(width! / height!).toBe(0.8)
   })
 
+  // format 'heif' alone would also let HEIC through. This build cannot encode
+  // HEVC, so the exclusion is pinned by rewriting an AVIF's ftyp brand, which
+  // makes sharp report compression 'hevc' over the same payload.
+  it('rejects HEIC, which shares the heif format string with AVIF', async () => {
+    const avif = await sharp({
+      create: { width: 1000, height: 1000, channels: 3, background: { r: 9, g: 9, b: 9 } },
+    }).avif({ quality: 40 }).toBuffer()
+    const heic = Buffer.from(avif)
+    heic.write('heic', 8)
+    const probe = await sharp(heic).metadata()
+    expect(probe.format).toBe('heif')
+    expect(probe.compression).toBe('hevc')
+    await expect(cropTo45(heic)).rejects.toThrow('desteklenmeyen görsel biçimi')
+  })
+
   it('rejects a decompression bomb whose byte size is small', async () => {
     // ~40000x4000 = 160MP, over the 64MP ceiling, but only a few MB on the wire
     // because it is a single flat colour.
@@ -212,5 +227,15 @@ describe('makeThumb', () => {
   it('produces a 320px-wide image', async () => {
     const { width } = await sharp(await makeThumb(await solid(2000, 2500))).metadata()
     expect(width).toBe(320)
+  })
+
+  // makeThumb is a decode path like cropTo45 and must not be the one that
+  // skips the pixel ceiling, even though it currently only ever sees
+  // cropTo45's own already-bounded output.
+  it('refuses to decode past the pixel ceiling', async () => {
+    const bomb = await sharp({
+      create: { width: 40000, height: 4000, channels: 3, background: { r: 1, g: 1, b: 1 } },
+    }).png({ compressionLevel: 9 }).toBuffer()
+    await expect(makeThumb(bomb)).rejects.toThrow(/pixel limit/i)
   })
 })
