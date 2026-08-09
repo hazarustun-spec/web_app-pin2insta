@@ -165,6 +165,43 @@ describe('slot labels', () => {
     // The first real slot goes to the first item that can actually use it.
     expect(labels.get('live')).toBe('Bugün 10:00')
   })
+
+  // The whole point of the label is telling the owner when a post goes out.
+  // An uncaptioned item does not yield its turn — selectForSlot leaves the slot
+  // empty and meets the same item at the head next tick — so everything behind
+  // it is waiting on an edit, not on a clock. Promising a time would be a lie
+  // the owner acts on by leaving the caption blank.
+  it('labels nothing at or below an uncaptioned item', () => {
+    const items = [
+      item({ id: 'a' }),
+      item({ id: 'blocker', caption: '' }),
+      item({ id: 'c' }),
+      item({ id: 'd' }),
+    ]
+    const labels = slotLabels(items, SETTINGS, now)
+    expect(labels.get('a')).toBe('Bugün 10:00')
+    expect(labels.has('blocker')).toBe(false)
+    expect(labels.has('c')).toBe(false)
+    expect(labels.has('d')).toBe(false)
+  })
+
+  it('labels the whole queue again once the blocker is captioned', () => {
+    const items = [item({ id: 'a' }), item({ id: 'b' }), item({ id: 'c' })]
+    expect([...slotLabels(items, SETTINGS, now).keys()]).toEqual(['a', 'b', 'c'])
+  })
+
+  it('labels nothing at all when the head itself is uncaptioned', () => {
+    const items = [item({ id: 'head', caption: '' }), item({ id: 'b' })]
+    expect(slotLabels(items, SETTINGS, now).size).toBe(0)
+  })
+
+  // A story publishes without a caption, so it does not block anything.
+  it('does not treat an uncaptioned story as a blockage', () => {
+    const items = [item({ id: 'a', kind: 'story', caption: '' }), item({ id: 'b' })]
+    const labels = slotLabels(items, SETTINGS, now)
+    expect(labels.get('a')).toBe('Bugün 10:00')
+    expect(labels.get('b')).toBe('Bugün 14:00')
+  })
 })
 
 describe('queueStatus', () => {
@@ -196,6 +233,21 @@ describe('queueStatus', () => {
     expect(s.headBlockedId).toBe(null)
     expect(s.unrecordedIds).toEqual(['stuck'])
     expect(s.waiting).toBe(1)
+  })
+
+  // Counting over every item rather than the ones a slot will be spent on
+  // inflates the banner with rows the scheduler will never look at.
+  it('counts only items a slot will actually be spent on', () => {
+    const s = queueStatus(
+      [
+        item({ id: 'a' }),
+        item({ id: 'stuck', caption: '', postedDate: '2026-08-08', slotIndex: 0 }),
+        item({ id: 'dead', caption: '', status: 'failed' }),
+        item({ id: 'real', caption: '' }),
+      ],
+      SETTINGS,
+    )
+    expect(s.missingCaptions).toBe(1)
   })
 
   it('counts days left at the configured rate', () => {

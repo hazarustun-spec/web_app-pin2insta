@@ -221,14 +221,22 @@ export function slotLabels(
   items: ViewItem[], settings: ViewSettings, now: Date,
 ): Map<string, string> {
   const waiting = items.filter(awaitsSlot)
-  const slots = upcomingSlots(now, settings.slots, settings.timezone, waiting.length)
+  // An uncaptioned item does not yield its turn — selectForSlot leaves the slot
+  // empty and finds the same item at the head on the next tick. So nothing
+  // below it has a knowable time, and promising one would be a lie the owner
+  // acts on. Label up to the blockage and no further.
+  const blocked = waiting.findIndex(needsCaption)
+  const schedulable = blocked === -1 ? waiting : waiting.slice(0, blocked + 1)
+  const slots = upcomingSlots(now, settings.slots, settings.timezone, schedulable.length)
   const out = new Map<string, string>()
-  waiting.forEach((item, i) => {
+  schedulable.forEach((item, i) => {
     const slot = slots[i]
     // upcomingSlots looks 400 days ahead and no further, so a queue longer than
     // that leaves the tail unlabelled rather than mislabelled.
     if (slot) out.set(item.id, labelForSlot(slot, settings, now))
   })
+  // The blocking item itself has no time either: its slot is skipped.
+  if (blocked !== -1) out.delete(schedulable[blocked].id)
   return out
 }
 

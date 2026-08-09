@@ -92,6 +92,12 @@ export function CaptionField({
       return
     }
 
+    // Same guard as the failure path. Two PATCHes can be in flight after two
+    // blurs inside one round trip, and they can resolve out of order; letting
+    // the older one win would roll `confirmed` back to a caption the field no
+    // longer shows, so the next blur would find nothing to save and the edit
+    // would be lost with no sign of it.
+    if (attempted.current !== attempt) return
     confirmed.current = attempt
     onSaved(itemId, attempt)
   }, [itemId, value, onSaved])

@@ -126,9 +126,19 @@ export function QueueClient({
   const onFiles = useCallback(
     async (files: File[]) => {
       setProgress({ done: 0, total: files.length })
-      const results = await uploadFiles(files, (done, total) => setProgress({ done, total }))
-      setProgress(null)
-      setNotes(describeUploadResults(results))
+      try {
+        const results = await uploadFiles(files, (done, total) => setProgress({ done, total }))
+        setNotes(describeUploadResults(results))
+      } catch (e) {
+        // Nothing in uploadFiles rejects today — every worker and every ingest
+        // POST is wrapped. The finally is what guarantees the dropzone can
+        // never stick on "yükleniyor…" with no notes, which is the shape of a
+        // drop that vanishes without explanation.
+        console.error('upload failed', e)
+        setNotes([{ tone: 'error', text: 'yükleme tamamlanamadı' }])
+      } finally {
+        setProgress(null)
+      }
       await load()
     },
     [load],

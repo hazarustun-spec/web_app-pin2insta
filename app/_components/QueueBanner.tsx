@@ -58,7 +58,14 @@ export function QueueBanner({
         <Alarm>{failed} gönderi üç denemede de paylaşılamadı.</Alarm>
       )}
       {missingCaptions > 0 && !headBlocked && (
-        <Alarm>{missingCaptions} gönderinin açıklaması eksik — sırası gelince atlanacak.</Alarm>
+        // NOT "skipped". selectForSlot only looks at the head and never steps
+        // past it, so an uncaptioned item stops the queue there — the slot goes
+        // empty and everything behind it waits indefinitely. Saying "skipped"
+        // told the owner the one thing that would make them leave it alone.
+        <Alarm>
+          {missingCaptions} gönderinin açıklaması eksik — sırası gelince kuyruk orada duracak,
+          sonrakiler paylaşılmayacak.
+        </Alarm>
       )}
       {waiting > 0 && daysLeft < 3 && (
         <Alarm>Kuyruk {daysLeft} gün sonra bitiyor. Yeni görsel ekle.</Alarm>
