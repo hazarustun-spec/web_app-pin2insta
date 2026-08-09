@@ -431,12 +431,23 @@ export async function groupIntoCarousel(ids: string[]) {
   const [head, ...rest] = ids
   // One atomic batch, in this order: the images are reassigned to the head
   // BEFORE the source rows go, or onDelete: 'cascade' takes them with it.
-  // `rest` already excludes the head, so the delete needs no further predicate.
+  //
+  // `rest` already excludes the head, but the delete still carries the posted
+  // guard, because the status check above is a SEPARATE round-trip. The cron
+  // publisher can mark one of these items `posted` in the window between that
+  // read and this write, and an unguarded delete would then destroy the row of
+  // a post that is live on Instagram — taking its permalink, its slot claim and
+  // (via metrics' cascade) its insights with it. deleteItem defends the same
+  // window for the same reason.
+  //
+  // Residual: the batch still commits, so an item posted mid-flight survives as
+  // a row whose image now belongs to the head carousel. An item showing no
+  // image is recoverable; an erased published post is not.
   await db.batch([
     db.update(items).set({ kind: 'carousel' }).where(eq(items.id, head)),
     ...ordered.map((img, i) =>
       db.update(images).set({ itemId: head, position: i }).where(eq(images.id, img.id)),
     ),
-    db.delete(items).where(inArray(items.id, rest)),
+    db.delete(items).where(and(inArray(items.id, rest), ne(items.status, 'posted'))),
   ] as unknown as BatchStatements)
 }

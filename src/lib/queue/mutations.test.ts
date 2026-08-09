@@ -395,9 +395,14 @@ describe('groupIntoCarousel', () => {
       { op: 'update', table: 'images', values: { itemId: 'c', position: 0 }, where: eq(images.id, 'i3') },
       { op: 'update', table: 'images', values: { itemId: 'c', position: 1 }, where: eq(images.id, 'i1') },
       { op: 'update', table: 'images', values: { itemId: 'c', position: 2 }, where: eq(images.id, 'i2') },
-      // The head is not in `rest`, so the delete needs no further predicate —
-      // and every image is already reassigned before the cascade could take it.
-      { op: 'delete', table: 'items', where: inArray(items.id, ['a', 'b']) },
+      // Every image is already reassigned before the cascade could take it.
+      // The head is not in `rest`, but the posted guard still rides along —
+      // see the dedicated test below for why.
+      {
+        op: 'delete',
+        table: 'items',
+        where: and(inArray(items.id, ['a', 'b']), ne(items.status, 'posted')),
+      },
     ])
     // Nothing ran outside the batch: a half-grouped carousel is a corrupt queue.
     expect(executed).toEqual([])
@@ -471,5 +476,54 @@ describe('groupIntoCarousel', () => {
     const e = await caught(groupIntoCarousel(['a', 'b']))
     expect(e).toBeInstanceOf(QueueError)
     expect(batch).not.toHaveBeenCalled()
+  })
+
+  // Both image bounds need a case ON the boundary. Zero images and twelve
+  // images are rejected by an off-by-one implementation too, so they prove
+  // nothing about where the boundary actually sits.
+  it('refuses a group that would hold exactly one image', async () => {
+    state.items = [item('a'), item('b')]
+    state.images = [img('i1', 'a')]
+    const e = await caught(groupIntoCarousel(['a', 'b']))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(batch).not.toHaveBeenCalled()
+  })
+
+  it('refuses a group that would hold exactly eleven images', async () => {
+    const ids = ['a', 'b']
+    state.items = ids.map((id) => item(id))
+    state.images = [
+      ...Array.from({ length: 6 }, (_, i) => img(`a${i}`, 'a', i)),
+      ...Array.from({ length: 5 }, (_, i) => img(`b${i}`, 'b', i)),
+    ]
+    const e = await caught(groupIntoCarousel(ids))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(batch).not.toHaveBeenCalled()
+  })
+
+  // The mock returns state.images whatever the predicate, so without this the
+  // images could be selected by the wrong column and every test still passes.
+  it('selects the images by item, not by image id', async () => {
+    state.items = [item('a'), item('b')]
+    state.images = [img('i1', 'a'), img('i2', 'b')]
+    await groupIntoCarousel(['a', 'b'])
+    expect(selectWheres).toContainEqual({
+      table: 'images',
+      where: inArray(images.itemId, ['a', 'b']),
+    })
+  })
+
+  // The status check is a separate round-trip, so the publisher can mark a
+  // source item posted in the window before the batch lands. An unguarded
+  // delete would erase the row of a post that is live on Instagram.
+  it('guards the delete against an item posted after the status check', async () => {
+    state.items = [item('a'), item('b')]
+    state.images = [img('i1', 'a'), img('i2', 'b')]
+    await groupIntoCarousel(['a', 'b'])
+    expect(batched()).toContainEqual({
+      op: 'delete',
+      table: 'items',
+      where: and(inArray(items.id, ['b']), ne(items.status, 'posted')),
+    })
   })
 })
