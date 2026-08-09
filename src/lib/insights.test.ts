@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { and, eq, desc, asc, isNotNull, inArray } from 'drizzle-orm'
+import { and, eq, desc, asc, isNotNull, inArray, ne } from 'drizzle-orm'
 import { items, images, metrics } from '@/src/db/schema'
 import { InstagramError } from '@/src/lib/instagram'
 import {
@@ -172,6 +172,7 @@ beforeEach(() => {
 /** 10:00, 14:00 and 20:00 as `items.slot_index` stores them since Task 10. */
 const TEN = 600
 const TWO = 840
+const TWENTY = 1200
 const EIGHT = 1200
 
 const row = (slotIndex: number, likes: number, extra: Partial<MetricRow> = {}): MetricRow => ({
@@ -331,14 +332,25 @@ describe('slotAdvice — states', () => {
     expect(advice.best.time).toBe('20:00')
   })
 
-  it('speaks at exactly the threshold and holds its tongue just inside it', () => {
-    // "lags the best by 30% OR MORE", so 70 against 100 is the first gap worth
-    // a sentence and 71 against 100 is not.
-    const at = slotPerformance([...many(8, TEN, 70), ...many(8, EIGHT, 100)])
+  it('speaks just outside the threshold and holds its tongue just inside it', () => {
+    // Named honestly: 1 - 70/100 is 0.30000000000000004, so 70-against-100 is
+    // just OUTSIDE the threshold, not on it. No pair of averages lands exactly
+    // on 0.3 in floating point, so `< MIN_GAP` and `<= MIN_GAP` are
+    // indistinguishable by behaviour — the constant is pinned separately below.
+    const outside = slotPerformance([...many(8, TEN, 70), ...many(8, EIGHT, 100)])
     const inside = slotPerformance([...many(8, TEN, 71), ...many(8, EIGHT, 100)])
-    expect(slotAdvice(at).state).toBe('weak-slot')
+    expect(1 - 70 / 100).toBeGreaterThan(0.3)
+    expect(slotAdvice(outside).state).toBe('weak-slot')
     expect(slotAdvice(inside).state).toBe('even')
+  })
+
+  // The floors decide whether the page gives advice at all, and every other
+  // test here is written against the symbols, so a changed value would go
+  // unnoticed. These are the only assertions that pin the numbers themselves.
+  it('holds its thresholds at the values that were reasoned about', () => {
     expect(MIN_GAP).toBe(0.3)
+    expect(MIN_SAMPLES).toBe(15)
+    expect(MIN_SLOT_SAMPLES).toBe(5)
   })
 
   it('honours an explicit minSamples, as the plan signature promises', () => {
@@ -379,12 +391,18 @@ const posted = (id: string, igMediaId: string | null = `ig-${id}`) => ({
 })
 
 describe('refreshInsights', () => {
-  it('reads only posted items that have an instagram id, newest first', async () => {
+  it('reads only measurable posted items that have an instagram id, newest first', async () => {
     state.items = [posted('a')]
     await refreshInsights()
     expect(selects[0]).toEqual({
       table: 'items',
-      where: and(eq(items.status, 'posted'), isNotNull(items.igMediaId)),
+      // Stories are excluded at the query: a refresh could only ever write
+      // zeros over one, and it would spend a Graph call to do it.
+      where: and(
+        eq(items.status, 'posted'),
+        isNotNull(items.igMediaId),
+        ne(items.kind, 'story'),
+      ),
       order: [desc(items.postedAt)],
       limit: REFRESH_LIMIT,
     })
@@ -546,6 +564,35 @@ describe('listPublished', () => {
     expect(post.imageCount).toBe(3)
   })
 
+  // A story has no likes, comments or saves, so it scores zero interactions
+  // however it performed. selectForSlot takes the head of the queue, so where
+  // stories land is arbitrary — and averaging them in lets that arbitrariness
+  // masquerade as a difference between posting times.
+  it('keeps stories out of the slot comparison', async () => {
+    const metric = { likes: 50, comments: 0, saved: 0, reach: 500 }
+    const zero = { likes: 0, comments: 0, saved: 0, reach: 0 }
+    state.items = [
+      // Every feed post scores exactly 50, in both slots.
+      ...Array.from({ length: 5 }, (_, i) => ({
+        ...publishedRow({ id: `t${i}`, slotIndex: TEN }), metric,
+      })),
+      ...Array.from({ length: 5 }, (_, i) => ({
+        ...publishedRow({ id: `e${i}`, slotIndex: TWENTY }), metric,
+      })),
+      // Three stories that happened to land on 20:00.
+      ...Array.from({ length: 3 }, (_, i) => ({
+        ...publishedRow({ id: `s${i}`, kind: 'story', slotIndex: TWENTY }), metric: zero,
+      })),
+    ]
+
+    const { stats, advice } = await listPublished()
+
+    expect(stats.map((s) => s.avgEngagement)).toEqual([50, 50])
+    expect(stats.map((s) => s.samples)).toEqual([5, 5])
+    // Identical performance must not produce a recommendation to change a time.
+    expect(advice.state).not.toBe('weak-slot')
+  })
+
   it('turns the stored slot index into a time', async () => {
     state.items = [publishedRow({ slotIndex: TEN })]
     const [post] = (await listPublished()).posts
@@ -589,18 +636,32 @@ describe('listPublished', () => {
 
 describe('metricState', () => {
   it('is measured once a metrics row exists', () => {
-    expect(metricState({ metric: { likes: 0, comments: 0, reach: 0, saved: 0 }, igMediaId: 'ig-a' }))
-      .toBe('measured')
+    expect(metricState({
+      kind: 'feed',
+      metric: { likes: 0, comments: 0, reach: 0, saved: 0 },
+      igMediaId: 'ig-a',
+    })).toBe('measured')
   })
 
   it('is pending for a post the next refresh will pick up', () => {
-    expect(metricState({ metric: null, igMediaId: 'ig-a' })).toBe('pending')
+    expect(metricState({ kind: 'feed', metric: null, igMediaId: 'ig-a' })).toBe('pending')
   })
 
   it('is unmeasurable for a post with no instagram id, not pending forever', () => {
     // media_publish answered 200 with no id. `refreshInsights` filters this
     // row out with `isNotNull(items.igMediaId)`, so "ölçüm bekleniyor" beside
     // it would be a wait that never ends.
-    expect(metricState({ metric: null, igMediaId: null })).toBe('unmeasurable')
+    expect(metricState({ kind: 'feed', metric: null, igMediaId: null })).toBe('unmeasurable')
+  })
+
+  // Instagram reports no likes, comments or saves for a story, so a metrics row
+  // holding zeros for one is not a measurement of anything. Printing
+  // "0 beğeni · 0 kaydetme" states a number that was never taken.
+  it('is unmeasurable for a story even with a metrics row', () => {
+    expect(metricState({
+      kind: 'story',
+      metric: { likes: 0, comments: 0, reach: 0, saved: 0 },
+      igMediaId: 'ig-a',
+    })).toBe('unmeasurable')
   })
 })

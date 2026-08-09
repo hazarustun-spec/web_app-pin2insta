@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, isNotNull, ne } from 'drizzle-orm'
 import { getDb } from '@/src/db'
 import { items, images, metrics } from '@/src/db/schema'
 import { getInstagramClient, isAuthError } from '@/src/lib/instagram'
@@ -312,7 +312,9 @@ export async function refreshInsights(limit = REFRESH_LIMIT): Promise<RefreshRep
   const db = getDb()
   const client = getInstagramClient()
   const posted = await db.select().from(items)
-    .where(and(eq(items.status, 'posted'), isNotNull(items.igMediaId)))
+    // Stories carry no interaction metrics, so a refresh would only ever write
+    // zeros over them and spend one of the 30 Graph calls doing it.
+    .where(and(eq(items.status, 'posted'), isNotNull(items.igMediaId), ne(items.kind, 'story')))
     .orderBy(desc(items.postedAt))
     .limit(limit)
 
@@ -424,7 +426,14 @@ export async function listPublished(limit = HISTORY_LIMIT): Promise<PublishedHis
 
   const stats = slotPerformance(
     rows
-      .filter((r) => r.metric !== null && r.item.slotIndex !== null)
+      // Stories are excluded, not merely unmeasured. A story has no likes, no
+      // comments and no `saved` metric at all, so it scores zero interactions
+      // by construction — and selectForSlot takes the head of the queue, so
+      // where stories land is arbitrary. Averaging them in lets three stories
+      // that happened to fall on 20:00 manufacture a 40% "difference" between
+      // slots whose feed posts performed identically, and the page then advises
+      // changing a posting time on the strength of it.
+      .filter((r) => r.metric !== null && r.item.slotIndex !== null && r.item.kind !== 'story')
       .map((r) => ({
         slotIndex: r.item.slotIndex!,
         likes: r.metric!.likes,
@@ -448,8 +457,12 @@ export async function listPublished(limit = HISTORY_LIMIT): Promise<PublishedHis
  * finished instead.
  */
 export function metricState(
-  post: Pick<PublishedPost, 'metric' | 'igMediaId'>,
+  post: Pick<PublishedPost, 'metric' | 'igMediaId' | 'kind'>,
 ): 'measured' | 'pending' | 'unmeasurable' {
+  // A story is unmeasurable whatever is in the row: Instagram reports no
+  // likes, comments or saves for one, so printing "0 beğeni · 0 kaydetme"
+  // states a measurement that was never taken.
+  if (post.kind === 'story') return 'unmeasurable'
   if (post.metric) return 'measured'
   return post.igMediaId ? 'pending' : 'unmeasurable'
 }
