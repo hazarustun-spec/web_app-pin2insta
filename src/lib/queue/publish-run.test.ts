@@ -762,6 +762,34 @@ describe('runPublish: thumbnail refresh never undoes a published post', () => {
  * three real photos a day for however long it takes to get a Meta app approved,
  * which is exactly the window the README's own ordering creates.
  */
+describe('runPublish — a scheduled post does not spend a slot', () => {
+  // allowanceBy caps a day at the number of slots the schedule allows by that
+  // hour, so that editing the slot times cannot make a re-numbered slot fire
+  // twice. It reads `scheduled_at IS NULL` to tell which of the day's posts a
+  // slot actually spent. Anything that erases that mark — clearing the field
+  // when the row is marked posted, say — makes every chosen time count against
+  // the slots and starves them, which is the opposite of "no daily cap".
+  it('publishes both a scheduled post and the slot due at the same time', async () => {
+    state.settings.push({
+      id: 1, slots: ['10:00', '14:00', '20:00'], timezone: 'Europe/Istanbul', hashtags: '',
+    })
+    // 09:00 Istanbul — due at 10:05 inside the 90-minute grace.
+    seedItem({ id: 'chosen', position: 1, scheduledAt: new Date('2026-08-10T06:00:00Z') })
+    seedItem({ id: 'auto', position: 2 })
+    seedImage({ itemId: 'chosen' })
+    seedImage({ itemId: 'auto' })
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(report.slots.map((s) => s.outcome)).toEqual(['posted', 'posted'])
+    // The scheduled row keeps its mark, which is what keeps it out of the
+    // slot allowance.
+    expect(state.items.find((r) => r.id === 'chosen')!.scheduledAt).not.toBeNull()
+  })
+})
+
 describe('runPublish — dry-run publishing is opt-in', () => {
   it('does nothing at all when the opt-in is absent', async () => {
     delete process.env.ALLOW_DRYRUN_PUBLISH

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { eq, ne, and, inArray, isNull } from 'drizzle-orm'
+import { eq, ne, and, or, inArray, isNull, isNotNull } from 'drizzle-orm'
 import { items, images } from '@/src/db/schema'
 // Type-only: erased at compile time, so it never evaluates the mocked module.
 import type { ItemKind } from './repo'
@@ -569,6 +569,31 @@ describe('setScheduledAt', () => {
     state.items = [pending({ scheduledAt: LATER })]
     await setScheduledAt('a', null, NOW)
     expect(executed[0].values).toEqual({ scheduledAt: null })
+  })
+
+  // The conflict check has to see rows that hold a minute WITHOUT carrying a
+  // scheduled_at of their own: an item already claimed into a slot holds
+  // (postedDate, slotIndex), and that pair is what the unique index collides
+  // on. Narrowing the query to `scheduledAt IS NOT NULL` alone would let this
+  // through, and the owner would find out as a race-lost days later.
+  it('reads rows that hold a minute through a slot claim, not only scheduled ones', async () => {
+    await setScheduledAt('a', LATER, NOW)
+    expect(selectWheres).toContainEqual({
+      table: 'items',
+      where: or(isNotNull(items.scheduledAt), eq(items.postedDate, '2026-08-09')),
+    })
+  })
+
+  it('refuses a minute a slot claim already holds', async () => {
+    // 14:35 Istanbul = minute 875 of 2026-08-09, already claimed by another
+    // item that carries no scheduled_at at all.
+    state.items = [
+      pending(),
+      { id: 'b', status: 'pending', postedDate: '2026-08-09', slotIndex: 875, scheduledAt: null },
+    ]
+    const e = await caught(setScheduledAt('a', LATER, NOW))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(executed).toEqual([])
   })
 
   it('refuses a time that has already gone, and writes nothing', async () => {

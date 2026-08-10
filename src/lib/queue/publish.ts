@@ -396,6 +396,13 @@ async function publishInto(
       permalink: result.permalink,
       postedAt: now,
       error: null,
+      // scheduled_at is deliberately NOT cleared. allowanceBy reads
+      // `scheduled_at IS NULL` to tell which of a day's posts a slot spent, so
+      // clearing it here would make every scheduled post count against the
+      // slots and starve them — the opposite of the no-daily-cap rule. The
+      // cost of leaving it is a narrow race (a time set between the slot
+      // candidate read and the claim) that leaves the day's allowance one
+      // short. That costs a slot; clearing it would cost the whole design.
     }).where(eq(items.id, item.id))
   } catch (e) {
     // Deliberately NOT rolled back. The claim written above already excludes

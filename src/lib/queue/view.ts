@@ -401,8 +401,15 @@ export function labelForSlot(slot: SlotRef, settings: ViewSettings, now: Date): 
   const tomorrow = localDate(new Date(now.getTime() + DAY_MS), settings.timezone)
   if (slot.date === today) return `Bugün ${time}`.trim()
   if (slot.date === tomorrow) return `Yarın ${time}`.trim()
-  const [, month, day] = slot.date.split('-')
-  return `${Number(day)} ${MONTHS_TR[Number(month) - 1]} ${time}`.trim()
+  const [year, month, day] = slot.date.split('-')
+  // The year appears only when it is not the current one. A datetime-local
+  // year spinner makes 2260 a plausible slip, and without the year the card
+  // reads "20 Ağu 14:00" — indistinguishable from this year. The post would
+  // then sit there forever: never due, so never missed, so no banner. Showing
+  // the year is what makes that mistake visible.
+  const showYear = year !== today.slice(0, 4)
+  const date = `${Number(day)} ${MONTHS_TR[Number(month) - 1]}${showYear ? ` ${year}` : ''}`
+  return `${date} ${time}`.trim()
 }
 
 /**

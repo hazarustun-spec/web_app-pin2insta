@@ -18,6 +18,7 @@ const NONE: Props = {
   unrecorded: 0,
   failed: 0,
   missed: 0,
+  scheduledWaiting: 0,
   scheduledBlocked: 0,
   daysLeft: 10,
   waiting: 30,

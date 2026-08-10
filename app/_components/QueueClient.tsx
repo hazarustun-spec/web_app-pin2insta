@@ -368,6 +368,7 @@ export function QueueClient({
         scheduledBlocked={status.scheduledBlocked}
         daysLeft={status.daysLeft}
         waiting={status.waiting}
+        scheduledWaiting={status.scheduledWaiting}
         notes={notes}
         onDismissNotes={() => setNotes([])}
       />

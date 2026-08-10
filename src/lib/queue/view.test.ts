@@ -166,6 +166,17 @@ describe('slot labels', () => {
     expect(labelForSlot(slots[6], SETTINGS, now)).toBe('11 Ağu 10:00')
   })
 
+  // A datetime-local year spinner makes 2260 a plausible slip. Without the
+  // year the card reads "20 Ağu 14:00", indistinguishable from this year — and
+  // the post then sits there forever: never due, so never missed, so no
+  // banner. The year is what makes the mistake visible.
+  it('shows the year only when it is not the current one', () => {
+    const thisYear = { date: '2026-08-20', index: 840, time: '14:00', at: new Date('2026-08-20T11:00:00Z') }
+    const wrongYear = { date: '2260-08-20', index: 840, time: '14:00', at: new Date('2260-08-20T11:00:00Z') }
+    expect(labelForSlot(thisYear, SETTINGS, now)).toBe('20 Ağu 14:00')
+    expect(labelForSlot(wrongYear, SETTINGS, now)).toBe('20 Ağu 2260 14:00')
+  })
+
   it('hands consecutive slots to the queue in order', () => {
     const items = [item({ id: 'a' }), item({ id: 'b' }), item({ id: 'c' }), item({ id: 'd' })]
     const labels = cardTimes(items, SETTINGS, now)

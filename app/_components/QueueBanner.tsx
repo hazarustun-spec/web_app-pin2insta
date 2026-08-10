@@ -31,6 +31,7 @@ export function QueueBanner({
   scheduledBlocked,
   daysLeft,
   waiting,
+  scheduledWaiting,
   notes,
   onDismissNotes,
 }: {
@@ -45,6 +46,7 @@ export function QueueBanner({
   scheduledBlocked: number
   daysLeft: number
   waiting: number
+  scheduledWaiting: number
   notes: Note[]
   onDismissNotes: () => void
 }) {
@@ -113,7 +115,15 @@ export function QueueBanner({
         </Alarm>
       )}
       {waiting > 0 && daysLeft < 3 && (
-        <Alarm>Kuyruk {daysLeft} gün sonra bitiyor. Yeni görsel ekle.</Alarm>
+        // daysLeft counts only the items the slots will spend. A queue of
+        // nothing but scheduled posts therefore reads 0 — "the queue runs out
+        // in 0 days" beside a screen full of future posts — so the scheduled
+        // ones are named rather than silently excluded.
+        <Alarm>
+          Slotlara verilecek gönderi {daysLeft} gün sonra bitiyor.
+          {scheduledWaiting > 0 && ` Ayrıca saati seçilmiş ${scheduledWaiting} gönderi bekliyor.`}
+          {' '}Yeni görsel ekle.
+        </Alarm>
       )}
       {notes.length > 0 && (
         <div className="mb-3 flex items-start justify-between gap-4">
