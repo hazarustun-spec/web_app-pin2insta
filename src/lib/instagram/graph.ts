@@ -19,8 +19,41 @@ export function graphBase(): string {
  * Parses a Graph API response defensively. A non-JSON body (e.g. an HTML error page from an
  * edge proxy) must not escape as a raw `SyntaxError` — every failure surfaces as `InstagramError`.
  */
-async function parseGraphResponse(res: Response) {
-  let json: any = null
+/** Whatever Graph sent back. Every field is optional because a failure can arrive in any shape. */
+type GraphBody = {
+  error?: { message?: string; type?: string; code?: number }
+  [key: string]: unknown
+}
+
+/**
+ * A string field of a Graph response, or ''.
+ *
+ * Graph sends ids, permalinks and status codes as strings, but a 200 can carry
+ * any shape — parseGraphResponse returns {} for an empty body. Returning ''
+ * rather than undefined keeps a missing id out of the database as an empty
+ * string, which every consumer already treats as "not recorded".
+ */
+function str(body: GraphBody, key: string): string {
+  const v = body[key]
+  return typeof v === 'string' ? v : ''
+}
+
+/** The `data` array of an insights response, narrowed from the untyped body. */
+type InsightRow = { name?: string; values?: { value?: number }[] }
+
+/** A numeric field of a Graph response, or 0 — a count Graph omits is a count of nothing. */
+function num(body: GraphBody, key: string): number {
+  const v = body[key]
+  return typeof v === 'number' ? v : 0
+}
+
+function insightRows(body: GraphBody): InsightRow[] {
+  const data = body.data
+  return Array.isArray(data) ? (data as InsightRow[]) : []
+}
+
+async function parseGraphResponse(res: Response): Promise<GraphBody> {
+  let json: GraphBody | null = null
   try {
     json = await res.json()
   } catch {
@@ -64,8 +97,7 @@ async function call(path: string, params: Record<string, string>, method: 'GET' 
 }
 
 async function container(igUserId: string, params: Record<string, string>): Promise<string> {
-  const { id } = await call(`/${igUserId}/media`, params, 'POST')
-  return id
+  return str(await call(`/${igUserId}/media`, params, 'POST'), 'id')
 }
 
 /** How long to wait for a container to finish before giving up and letting the tick retry. */
@@ -88,8 +120,10 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
  */
 async function awaitContainer(creationId: string): Promise<void> {
   for (let attempt = 0; attempt < READY_ATTEMPTS; attempt++) {
-    const { status_code: status } = await call(`/${creationId}`, { fields: 'status_code' }, 'GET')
-    if (status === 'FINISHED' || status === undefined) return
+    const status = str(await call(`/${creationId}`, { fields: 'status_code' }, 'GET'), 'status_code')
+    // '' means the body carried no status_code: degrade to the pre-poll
+    // behaviour, where media_publish itself rejects an unready container.
+    if (status === 'FINISHED' || status === '') return
     if (status === 'ERROR' || status === 'EXPIRED') {
       throw new InstagramError(`container ${String(status).toLowerCase()}`)
     }
@@ -144,7 +178,7 @@ export function createGraphClient(): InstagramClient {
 
       await awaitContainer(creationId)
 
-      const { id } = await call(`/${igUserId}/media_publish`, { creation_id: creationId }, 'POST')
+      const id = str(await call(`/${igUserId}/media_publish`, { creation_id: creationId }, 'POST'), 'id')
 
       // NOTHING BELOW THIS LINE MAY THROW. media_publish is the irreversible
       // step — the post is on the account the moment it returns. The scheduler
@@ -157,7 +191,7 @@ export function createGraphClient(): InstagramClient {
       try {
         // parseGraphResponse returns `json ?? {}` on a 200, so a well-formed
         // but empty body must not put `undefined` into a non-null column.
-        permalink = (await call(`/${id}`, { fields: 'permalink' }, 'GET')).permalink ?? ''
+        permalink = str(await call(`/${id}`, { fields: 'permalink' }, 'GET'), 'permalink')
       } catch (e) {
         console.error('permalink lookup failed after publishing', id, e)
       }
@@ -165,11 +199,11 @@ export function createGraphClient(): InstagramClient {
     },
 
     async permalink(mediaId: string) {
-      return (await call(`/${mediaId}`, { fields: 'permalink' }, 'GET')).permalink ?? ''
+      return str(await call(`/${mediaId}`, { fields: 'permalink' }, 'GET'), 'permalink')
     },
 
     async insights(mediaId: string) {
-      const [{ like_count = 0, comments_count = 0 }, insight] = await Promise.all([
+      const [counts, insight] = await Promise.all([
         call(`/${mediaId}`, { fields: 'like_count,comments_count' }, 'GET'),
         call(`/${mediaId}/insights`, { metric: 'reach,saved' }, 'GET').catch((err) => {
           // A brand-new account genuinely has no insights yet and this call errors — treat that
@@ -180,11 +214,11 @@ export function createGraphClient(): InstagramClient {
         }),
       ])
       const byName = Object.fromEntries(
-        (insight.data ?? []).map((m: any) => [m.name, m.values?.[0]?.value ?? 0]),
+        insightRows(insight).map((m) => [m.name, m.values?.[0]?.value ?? 0]),
       )
       return {
-        likes: like_count,
-        comments: comments_count,
+        likes: num(counts, 'like_count'),
+        comments: num(counts, 'comments_count'),
         reach: byName.reach ?? 0,
         saved: byName.saved ?? 0,
       }
