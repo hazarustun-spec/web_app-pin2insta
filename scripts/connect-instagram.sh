@@ -4,7 +4,10 @@
 # one, finds the Instagram Business Account id behind your Facebook Page, writes
 # both into Vercel production, and redeploys.
 #
-#   ./scripts/connect-instagram.sh <APP_SECRET> <SHORT_LIVED_TOKEN>
+#   ./scripts/connect-instagram.sh <APP_SECRET> <SHORT_LIVED_TOKEN> [PAGE_ID]
+#
+# PAGE_ID is only needed when the Page is owned by a Business Portfolio, which
+# is when me/accounts comes back empty despite the token being fine.
 #
 # Neither secret is printed. The only things echoed are the Page name, the
 # Instagram user id (not a secret) and the token's expiry date.
@@ -22,7 +25,7 @@ APP_SECRET=${1:-}
 SHORT_TOKEN=${2:-}
 
 if [[ -z "$APP_SECRET" || -z "$SHORT_TOKEN" ]]; then
-  echo "usage: $0 <APP_SECRET> <SHORT_LIVED_TOKEN>" >&2
+  echo "usage: $0 <APP_SECRET> <SHORT_LIVED_TOKEN> [PAGE_ID]" >&2
   exit 1
 fi
 
@@ -53,16 +56,27 @@ else
 fi
 
 echo "2/5  finding your Facebook Page…"
-PAGES=$(curl -sS -G "$GRAPH/me/accounts" --data-urlencode "access_token=$LONG_TOKEN")
-PAGE_COUNT=$(printf '%s' "$PAGES" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(String((j.data??[]).length))})')
-if [[ "$PAGE_COUNT" == "0" ]]; then
-  echo "     no Pages. The Instagram account must be linked to a Facebook Page," >&2
-  echo "     and the token needs the pages_show_list permission." >&2
-  exit 1
+# me/accounts lists Pages the profile holds a DIRECT role on. A Page owned by a
+# Business Portfolio is reached through the portfolio instead, and comes back
+# empty here even when the token can read the Page perfectly well by id. So the
+# id is accepted as an argument, and the listing is only a convenience.
+PAGE_ID=${3:-}
+if [[ -z "$PAGE_ID" ]]; then
+  PAGES=$(curl -sS -G "$GRAPH/me/accounts" --data-urlencode "access_token=$LONG_TOKEN")
+  PAGE_COUNT=$(printf '%s' "$PAGES" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);process.stdout.write(String((j.data??[]).length))})')
+  if [[ "$PAGE_COUNT" == "0" ]]; then
+    echo "     me/accounts is empty." >&2
+    echo "     That is normal for a Page owned by a Business Portfolio. Pass the Page" >&2
+    echo "     id as a third argument:  $0 <APP_SECRET> <SHORT_TOKEN> <PAGE_ID>" >&2
+    echo "     Find it in Business Suite → Settings → Accounts → Pages." >&2
+    exit 1
+  fi
+  printf '%s' "$PAGES" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+    for (const p of JSON.parse(s).data ?? []) console.log("     -", p.name, "("+p.id+")")})'
+  PAGE_ID=$(printf '%s' "$PAGES" | field data.0.id)
+else
+  echo "     using the Page id you passed: $PAGE_ID"
 fi
-printf '%s' "$PAGES" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
-  for (const p of JSON.parse(s).data ?? []) console.log("     -", p.name, "("+p.id+")")})'
-PAGE_ID=$(printf '%s' "$PAGES" | field data.0.id)
 
 echo "3/5  finding the Instagram account behind it…"
 IG_JSON=$(curl -sS -G "$GRAPH/$PAGE_ID" \
