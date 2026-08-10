@@ -7,11 +7,20 @@ name: pin2insta cron
 # excluded from the session proxy.
 on:
   schedule:
-    # Every 15 minutes. GitHub's scheduler drifts under load and can be several
-    # minutes late — dueSlots carries a 90-minute grace window to absorb that,
-    # and the (posted_date, slot_index) unique index makes an overlapping run
-    # harmless.
-    - cron: '*/15 * * * *'
+    # Every 30 minutes, which is what keeps a private repo inside GitHub's free
+    # 2,000 Actions minutes a month — every run is billed rounded up to a whole
+    # minute, and 15-minute ticks come to ~2,880.
+    #
+    # Nothing is lost by the wider spacing. dueSlots keeps a slot due for 90
+    # minutes, so it still gets three chances, and GitHub's scheduler drifts
+    # under load — the grace window exists to absorb exactly that. Retries are
+    # actually better served: MAX_ATTEMPTS is 3, and spreading them across 90
+    # minutes rather than 45 lets a brief outage at Meta pass. The cost is that
+    # a post can go out up to 30 minutes after its slot instead of 15.
+    #
+    # NOTE: this string is matched verbatim by the job's `if:` below. Changing
+    # one without the other silently stops the scheduled run.
+    - cron: '*/30 * * * *'
     # Insights are free and change slowly; four times a day is plenty. The odd
     # minute keeps it off the crowded top of the hour.
     - cron: '17 */6 * * *'
@@ -28,7 +37,7 @@ on:
 
 jobs:
   publish:
-    if: github.event.schedule == '*/15 * * * *' || inputs.job == 'publish'
+    if: github.event.schedule == '*/30 * * * *' || inputs.job == 'publish'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger publish

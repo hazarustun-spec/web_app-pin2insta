@@ -99,6 +99,18 @@ secrets under Settings → Secrets and variables → Actions:
 - `APP_URL` — the production URL, no trailing slash
 - `CRON_SECRET` — the same value you set in Vercel
 
+The publish job runs every 30 minutes and the insights job four times a day.
+That spacing is deliberate: a private repository gets 2,000 free Actions
+minutes a month and every run is billed rounded up to a whole minute, so
+15-minute ticks would come to roughly 2,880 and start costing money. Nothing is
+lost — `dueSlots` keeps a slot due for 90 minutes, so it still gets three
+chances, and the three publish attempts spread across 90 minutes instead of 45,
+which lets a brief outage at Meta pass. A post can go out up to 30 minutes
+after its slot rather than 15.
+
+Both cron strings are matched verbatim by their job's `if:` guard. Change one
+without the other and the scheduled run stops silently.
+
 Note that GitHub disables scheduled workflows in a repository with no activity
 for 60 days. If posting stops for no apparent reason, check the Actions tab
 first.
