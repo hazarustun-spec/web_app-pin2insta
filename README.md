@@ -48,19 +48,33 @@ deleted — so it is gated behind `ALLOW_DRYRUN_PUBLISH=1`. See step 4 below.
 integrations and are already set. Add the three secrets:
 
 ```bash
-# printf, not echo: openssl adds a trailing newline, and a secret with edge
-# whitespace can never match a header HTTP has already trimmed.
-P=$(openssl rand -hex 16); echo "ADMIN_PASSWORD=$P   ← save this, it is your login"
-printf '%s' "$P"                | vercel env add ADMIN_PASSWORD production
-printf '%s' "$(openssl rand -hex 32)" | vercel env add SESSION_SECRET production
-C=$(openssl rand -hex 32); echo "CRON_SECRET=$C      ← save this, GitHub needs it"
-printf '%s' "$C"                | vercel env add CRON_SECRET production
+# --value, not a pipe: piping is ambiguous about the trailing newline, and a
+# CRON_SECRET with one can never match a header HTTP has already trimmed —
+# the route would answer 503 forever.
+P=$(openssl rand -hex 16); echo "ADMIN_PASSWORD=$P   ← write this down NOW"
+vercel env add ADMIN_PASSWORD production --value "$P" --yes
+
+C=$(openssl rand -hex 32); echo "CRON_SECRET=$C      ← write this down, GitHub needs it"
+vercel env add CRON_SECRET production --value "$C" --yes
+
+vercel env add SESSION_SECRET production --value "$(openssl rand -hex 32)" --yes
 
 vercel deploy --prod
 ```
 
-If you lose the password, `vercel env pull .env.local` prints it back into that
-file.
+**Write the password down before you close the terminal.** Vercel marks
+production variables *sensitive* by default, which means write-only: `vercel
+env ls` will show them as set and `vercel env pull` will bring them back as
+empty strings. That is not a fault — it is what sensitive means. If you lose
+the password the only way back is to overwrite it:
+
+```bash
+vercel env rm ADMIN_PASSWORD production --yes
+vercel env add ADMIN_PASSWORD production --value "$(openssl rand -hex 16)" --yes
+```
+
+The same write-only rule is why the values cannot be verified from the CLI. The
+check that matters is step 3 below: log in, and call the cron endpoint.
 
 Three things that will otherwise cost you an afternoon:
 
