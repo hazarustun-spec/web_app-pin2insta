@@ -60,7 +60,7 @@ describe('toIngestFailure', () => {
 // the only thing standing between that and a server-side request forgery, so it
 // is tested against the standard bypass repertoire.
 describe('isStagedBlobUrl', () => {
-  const HOST = 'br8lst74pmncgcsn.public.blob.vercel-storage.com'
+  const HOST = 'examplestore1234.public.blob.vercel-storage.com'
   const good = `https://${HOST}/tmp/abc-123.jpg`
 
   it('accepts a staged object in our own blob store', () => {
