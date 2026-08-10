@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { eq, ne, and, inArray } from 'drizzle-orm'
+import { eq, ne, and, inArray, isNull } from 'drizzle-orm'
 import { items, images } from '@/src/db/schema'
 // Type-only: erased at compile time, so it never evaluates the mocked module.
 import type { ItemKind } from './repo'
@@ -24,6 +24,7 @@ const selectWheres = vi.hoisted(() => [] as { table: string; where: unknown }[])
 const state = vi.hoisted(() => ({
   items: [] as Record<string, unknown>[],
   images: [] as Record<string, unknown>[],
+  settings: [] as Record<string, unknown>[],
   updateReturning: [] as Record<string, unknown>[],
   deleteReturning: [] as Record<string, unknown>[],
 }))
@@ -32,7 +33,8 @@ vi.mock('@/src/lib/images/storage', () => ({ uploadImage: vi.fn(), deleteImage }
 
 vi.mock('@/src/db', async () => {
   const { getTableName } = await import('drizzle-orm')
-  const rowsOf = (table: string) => (table === 'items' ? state.items : state.images)
+  const rowsOf = (table: string) =>
+    table === 'items' ? state.items : table === 'settings' ? state.settings : state.images
   const resultOf = (desc: Rec) =>
     desc.op === 'delete' ? state.deleteReturning : state.updateReturning
   const stmt = (desc: Rec) => ({
@@ -87,6 +89,7 @@ const {
   orderCarouselImages,
   setCaption,
   setKind,
+  setScheduledAt,
   deleteItem,
   groupIntoCarousel,
 } = await import('./repo')
@@ -115,6 +118,7 @@ beforeEach(() => {
   selectWheres.length = 0
   state.items = []
   state.images = []
+  state.settings = []
   state.updateReturning = [{ id: 'a' }]
   state.deleteReturning = [{ id: 'a' }]
 })
@@ -525,5 +529,129 @@ describe('groupIntoCarousel', () => {
       table: 'items',
       where: and(inArray(items.id, ['b']), ne(items.status, 'posted')),
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 14: the owner's own time for one post.
+// ---------------------------------------------------------------------------
+
+describe('setScheduledAt', () => {
+  /** 2026-08-09 08:00 Europe/Istanbul. */
+  const NOW = new Date('2026-08-09T05:00:00Z')
+  /** 14:35 the same day, in Istanbul. */
+  const LATER = new Date('2026-08-09T11:35:00Z')
+  const pending = (over: Record<string, unknown> = {}) => ({
+    id: 'a', status: 'pending', postedDate: null, slotIndex: null, scheduledAt: null, ...over,
+  })
+
+  beforeEach(() => {
+    state.items = [pending()]
+    state.settings = [{ id: 1, slots: ['10:00', '14:00', '20:00'], timezone: 'Europe/Istanbul', hashtags: '' }]
+  })
+
+  it('stores the chosen time, truncated to the minute', async () => {
+    // Seconds are not part of the identity: 14:35:30 and 14:35:00 are the same
+    // claim, so storing the seconds would let two cards look different and
+    // collide anyway.
+    await setScheduledAt('a', new Date('2026-08-09T11:35:47.500Z'), NOW)
+    expect(executed).toEqual([
+      {
+        op: 'update',
+        table: 'items',
+        values: { scheduledAt: new Date('2026-08-09T11:35:00.000Z') },
+        where: and(eq(items.id, 'a'), eq(items.status, 'pending'), isNull(items.postedDate)),
+      },
+    ])
+  })
+
+  it('clears the time, putting the item back in the slot queue', async () => {
+    state.items = [pending({ scheduledAt: LATER })]
+    await setScheduledAt('a', null, NOW)
+    expect(executed[0].values).toEqual({ scheduledAt: null })
+  })
+
+  it('refuses a time that has already gone, and writes nothing', async () => {
+    const e = await caught(setScheduledAt('a', new Date(NOW.getTime() - 60_000), NOW))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(e.message).toBe('geçmiş bir saat seçilemez')
+    expect(executed).toEqual([])
+  })
+
+  it('refuses a minute another item already holds', async () => {
+    // The publisher would discover this at 14:35 and report `race-lost`; the
+    // owner finds out here instead, before saving.
+    state.items = [pending(), pending({ id: 'b', scheduledAt: LATER })]
+    const e = await caught(setScheduledAt('a', LATER, NOW))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(e.message).toBe('bu dakika dolu — başka bir saat seçin')
+    expect(executed).toEqual([])
+  })
+
+  it('refuses a minute a posted-unrecorded row is holding', async () => {
+    // 14:00 today is claimed by a row that already went to Instagram.
+    state.items = [pending(), pending({ id: 'stuck', postedDate: '2026-08-09', slotIndex: 840 })]
+    const e = await caught(setScheduledAt('a', new Date('2026-08-09T11:00:00Z'), NOW))
+    expect(e.message).toBe('bu dakika dolu — başka bir saat seçin')
+  })
+
+  it('lets an item keep the minute it already has', async () => {
+    state.items = [pending({ scheduledAt: LATER })]
+    await setScheduledAt('a', LATER, NOW)
+    expect(executed).toHaveLength(1)
+  })
+
+  it('does not count an item no publish will reach as holding a minute', async () => {
+    // A failed item never claims anything, so its time is free to take.
+    state.items = [pending(), pending({ id: 'dead', status: 'failed', scheduledAt: LATER })]
+    await setScheduledAt('a', LATER, NOW)
+    expect(executed).toHaveLength(1)
+  })
+
+  it('reads the timezone from the settings row rather than assuming one', async () => {
+    // The claim a slot holds is (local date, minute of that day), so which
+    // minute an instant collides with depends on the configured zone. 11:00 UTC
+    // is 13:00 in Berlin (minute 780) and 14:00 in Istanbul (minute 840): with
+    // Berlin configured, the row holding 780 is the one in the way.
+    state.settings = [{ id: 1, slots: ['10:00'], timezone: 'Europe/Berlin', hashtags: '' }]
+    state.items = [pending(), pending({ id: 'stuck', postedDate: '2026-08-09', slotIndex: 780 })]
+
+    const e = await caught(setScheduledAt('a', new Date('2026-08-09T11:00:00Z'), NOW))
+
+    expect(selectWheres.some((w) => w.table === 'settings')).toBe(true)
+    expect(e.message).toBe('bu dakika dolu — başka bir saat seçin')
+  })
+
+  it('reports an item that does not exist', async () => {
+    state.items = []
+    const e = await caught(setScheduledAt('nope', LATER, NOW))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(e.message).toBe('öğe bulunamadı')
+    expect(executed).toEqual([])
+  })
+
+  it('refuses an item that has already been published', async () => {
+    state.items = [pending({ status: 'posted', postedDate: '2026-08-08', slotIndex: 600 })]
+    const e = await caught(setScheduledAt('a', LATER, NOW))
+    expect(e.message).toBe('yalnızca bekleyen gönderiye saat verilebilir')
+    expect(executed).toEqual([])
+  })
+
+  it('refuses an item that is holding a slot claim already', async () => {
+    // posted-unrecorded: Instagram has it, the row does not say so. Giving it a
+    // time would promise a post that will never happen.
+    state.items = [pending({ postedDate: '2026-08-09', slotIndex: 600 })]
+    const e = await caught(setScheduledAt('a', LATER, NOW))
+    expect(e.message).toBe('yalnızca bekleyen gönderiye saat verilebilir')
+    expect(executed).toEqual([])
+  })
+
+  it('refuses when the cron run claims the item between the read and the write', async () => {
+    // The same window deleteItem defends: the guard is repeated INSIDE the
+    // update predicate, and the row count is what reports the loss.
+    state.updateReturning = []
+    const e = await caught(setScheduledAt('a', LATER, NOW))
+    expect(e).toBeInstanceOf(QueueError)
+    expect(e.message).toBe('gönderi artık beklemiyor — sayfayı yenileyin')
   })
 })

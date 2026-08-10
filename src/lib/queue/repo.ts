@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto'
-import { eq, ne, and, sql, inArray, asc } from 'drizzle-orm'
+import { eq, ne, and, or, sql, inArray, asc, isNotNull, isNull } from 'drizzle-orm'
 import type { BatchItem } from 'drizzle-orm/batch'
 import { getDb } from '@/src/db'
-import { items, images } from '@/src/db/schema'
+import { items, images, settings } from '@/src/db/schema'
 import { sha256, cropTo45, ImageValidationError } from '@/src/lib/images/process'
 import { uploadImage, deleteImage } from '@/src/lib/images/storage'
+import { localDate, startOfMinute } from './slots'
+import {
+  resolveViewSettings, scheduleProblem, takenScheduleKeys, type ScheduleRow,
+} from './view'
 
 export type IngestDecision = { status: 'added' } | { status: 'duplicate' }
 
@@ -339,6 +343,75 @@ export async function setKind(id: string, kind: ItemKind) {
   const problem = kindShapeError(kind, imgs.length)
   if (problem) throw new QueueError(problem)
   await db.update(items).set({ kind }).where(eq(items.id, id))
+}
+
+/**
+ * Gives one item its own publish time, or takes it away (`null` = back to the
+ * next free slot).
+ *
+ * DECISIONS:
+ * - The time is truncated to the minute, because the minute IS the claim: at
+ *   publish time it becomes (posted_date, slot_index), and 14:35:00 and
+ *   14:35:30 are the same row in `items_slot_unique_idx`. Storing the seconds
+ *   would let two cards look different and collide anyway.
+ * - The past and the collision are refused HERE, with the same function the
+ *   card uses (`scheduleProblem`), rather than left for the publisher to
+ *   discover. The publisher's answer to a taken minute is `race-lost` — no
+ *   post, no error, nothing on screen until the time has gone by.
+ * - Only a pending item with no claim may be given a time. A posted row's time
+ *   has happened; a posted-unrecorded row is holding a slot and will never
+ *   publish again, so a time on it would promise something that cannot occur.
+ * - That guard is repeated INSIDE the update predicate, exactly as deleteItem
+ *   repeats its own: the cron publisher can claim this item in the window
+ *   between the read and the write, and `.returning()` is what reports it.
+ * - `now` is a parameter with a default so the caller's clock is testable; the
+ *   SERVER's clock is the authority, not the browser's.
+ */
+export async function setScheduledAt(id: string, at: Date | null, now: Date = new Date()) {
+  const db = getDb()
+  const [row] = await db
+    .select({ status: items.status, postedDate: items.postedDate })
+    .from(items)
+    .where(eq(items.id, id))
+  if (!row) throw new QueueError('öğe bulunamadı')
+  if (row.status !== 'pending' || row.postedDate !== null) {
+    throw new QueueError('yalnızca bekleyen gönderiye saat verilebilir')
+  }
+
+  const minute = at === null ? null : startOfMinute(at)
+  if (minute !== null) {
+    const [cfg] = await db.select().from(settings).where(eq(settings.id, 1))
+    // The same fallbacks the page renders on: an empty settings table must not
+    // make this throw, and a bad timezone must not shift the minute silently.
+    const { timezone } = resolveViewSettings(cfg)
+    // Only the rows that could possibly hold this minute: something with a time
+    // of its own, or something already claiming a slot on that local date.
+    const others = await db
+      .select({
+        id: items.id,
+        status: items.status,
+        postedDate: items.postedDate,
+        slotIndex: items.slotIndex,
+        scheduledAt: items.scheduledAt,
+      })
+      .from(items)
+      .where(or(isNotNull(items.scheduledAt), eq(items.postedDate, localDate(minute, timezone))))
+    const rows: ScheduleRow[] = others.map((r) => ({
+      ...r,
+      // `chosenTimeFor` reads the ISO string the page carries; the driver hands
+      // back a Date. One shape reaches the shared rule, from both sides.
+      scheduledAt: r.scheduledAt ? r.scheduledAt.toISOString() : null,
+    }))
+    const problem = scheduleProblem(minute, now, takenScheduleKeys(rows, timezone, id), timezone)
+    if (problem) throw new QueueError(problem)
+  }
+
+  const updated = await db
+    .update(items)
+    .set({ scheduledAt: minute })
+    .where(and(eq(items.id, id), eq(items.status, 'pending'), isNull(items.postedDate)))
+    .returning({ id: items.id })
+  if (updated.length === 0) throw new QueueError('gönderi artık beklemiyor — sayfayı yenileyin')
 }
 
 /**

@@ -33,7 +33,11 @@ export default async function QueuePage() {
       listQueue(),
       getDb().select().from(settingsTable),
     ])
-    items = rows
+    // `scheduled_at` arrives from Drizzle as a Date and from `/api/items` as
+    // an ISO string, and the client refetches through the second one. Converted
+    // here so the page and its reloads agree on the shape — `ViewItem` declares
+    // the string, so TypeScript refuses to let this drift.
+    items = rows.map((r) => ({ ...r, scheduledAt: r.scheduledAt?.toISOString() ?? null }))
     settings = resolveViewSettings(settingsRows[0])
   } catch (e) {
     // Never surfaced verbatim: a Drizzle or Neon failure can carry a hostname

@@ -74,6 +74,72 @@ export function localDate(now: Date, timeZone: string): string {
   }).format(now)
 }
 
+/**
+ * The wall-clock time in `timeZone` at instant `at`, as `HH:MM`.
+ *
+ * The inverse of `slotAt` for the minute half, exactly as `localDate` is for
+ * the date half. `hourCycle: 'h23'` rather than `hour12: false`, which several
+ * ICU versions render as `24:00` at local midnight — and 24*60 is not a
+ * `slot_index` the unique key can hold.
+ */
+export function localTime(at: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(at)
+}
+
+/**
+ * `at` with its seconds and milliseconds dropped.
+ *
+ * A per-post time is stored to the minute because the minute is its IDENTITY:
+ * `slot_index` is minutes since local midnight, so 14:35:00 and 14:35:30 are
+ * the same claim. Truncating on the way in is what lets the queue page refuse
+ * the collision before the publisher has to discover it.
+ */
+export function startOfMinute(at: Date): Date {
+  return new Date(Math.floor(at.getTime() / 60_000) * 60_000)
+}
+
+/**
+ * The claim a per-post scheduled time makes, in the same space a slot claims:
+ * (local date, minutes since local midnight).
+ *
+ * This is deliberately not a second numbering scheme. `items_slot_unique_idx`
+ * is on (posted_date, slot_index), so a scheduled post at 10:00 and the 10:00
+ * slot are the SAME claim and cannot both publish — which is the property that
+ * keeps "no daily cap" from meaning "two posts in the same minute".
+ */
+export function scheduledRef(at: Date, timeZone: string): SlotRef {
+  const minute = startOfMinute(at)
+  const time = localTime(minute, timeZone)
+  return { date: localDate(minute, timeZone), time, index: slotIndexFor(time), at: minute }
+}
+
+/**
+ * How long a slot — or a per-post time — stays due after it arrives.
+ *
+ * One constant, used by `dueSlots` and by `dueState`, because a scheduled time
+ * that outlived a slot (or died before one) would be a second rule the owner
+ * has to learn, and the report on the queue page would disagree with what the
+ * publisher does.
+ */
+export const DUE_GRACE_MINUTES = 90
+
+/**
+ * Whether a per-post time has arrived, is still due, or has been missed.
+ *
+ * A missed time DOES NOT ROLL FORWARD, for the same reason a missed slot does
+ * not: catching up hours late posts at a time the owner did not choose, and
+ * several at once if the cron was down for a while.
+ */
+export function dueState(
+  at: Date, now: Date, graceMinutes = DUE_GRACE_MINUTES,
+): 'early' | 'due' | 'missed' {
+  const delta = now.getTime() - at.getTime()
+  if (delta < 0) return 'early'
+  return delta <= graceMinutes * 60_000 ? 'due' : 'missed'
+}
+
 /** The UTC instant of local wall-clock `time` on `dateISO` in `timeZone`. */
 export function slotAt(dateISO: string, time: string, timeZone: string): Date {
   const [y, m, d] = dateISO.split('-').map(Number)
@@ -94,7 +160,9 @@ function refsForDate(dateISO: string, slots: string[], timeZone: string): SlotRe
  * Slots that have arrived but are not yet stale. A slot older than
  * `graceMinutes` is missed for good — catching up would post twice in an hour.
  */
-export function dueSlots(now: Date, slots: string[], timeZone: string, graceMinutes = 90): SlotRef[] {
+export function dueSlots(
+  now: Date, slots: string[], timeZone: string, graceMinutes = DUE_GRACE_MINUTES,
+): SlotRef[] {
   const today = localDate(now, timeZone)
   const yesterday = localDate(new Date(now.getTime() - DAY_MS), timeZone)
   const grace = graceMinutes * 60_000

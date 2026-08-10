@@ -44,7 +44,7 @@ const TODAY = '2026-08-10'
 function seedItem(over: Partial<Row> = {}): Row {
   const row: Row = {
     id: 'a', kind: 'feed', caption: 'a caption', position: 1, status: 'pending',
-    attempts: 0, error: null, postedDate: null, slotIndex: null,
+    attempts: 0, error: null, postedDate: null, slotIndex: null, scheduledAt: null,
     igMediaId: null, permalink: null, postedAt: null,
     createdAt: new Date('2026-08-01T00:00:00Z'),
     ...over,
@@ -823,5 +823,384 @@ describe('runPublish — dry-run publishing is opt-in', () => {
     expect(report.dryRun).toBe(false)
     expect(report.disabled).toBeUndefined()
     expect(report.slots[0]).toMatchObject({ outcome: 'posted' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 14: an item may carry its own time. It publishes AT that time, claiming
+// the minute exactly as a slot claims one, and it is never spent on a slot.
+// ---------------------------------------------------------------------------
+
+/** 09:00 Istanbul on the test day — before every configured slot. */
+const NINE = new Date('2026-08-10T06:00:00Z')
+/** Five minutes later: the cron tick that finds it due. */
+const AT_09_05 = new Date('2026-08-10T06:05:00Z')
+const NINE_INDEX = 540
+
+describe('runPublish — an item that carries its own time', () => {
+  it('publishes it at its own minute, claiming that minute the way a slot does', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_09_05)
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(report.slots).toEqual([
+      { date: TODAY, index: NINE_INDEX, outcome: 'posted', itemId: 'a', scheduled: true },
+    ])
+    // The claim is in the SAME space a slot claims, which is what makes
+    // items_slot_unique_idx cover both kinds of post.
+    expect(itemRow()).toMatchObject({
+      status: 'posted', postedDate: TODAY, slotIndex: NINE_INDEX, postedAt: AT_09_05, attempts: 0,
+    })
+  })
+
+  it('does not publish before the minute arrives', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    const publish = spyClient()
+
+    // 08:59 Istanbul, one minute early — and no slot is due either.
+    const report = await runPublish(new Date('2026-08-10T05:59:00Z'))
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([])
+    expect(itemRow()).toMatchObject({ status: 'pending', postedDate: null })
+  })
+
+  it('does not publish once the grace window has passed, and does not roll it forward', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    const publish = spyClient()
+
+    // 10:31 Istanbul: 91 minutes after 09:00, so the chosen time is missed —
+    // and the 10:00 slot that IS due must not quietly post it instead.
+    const report = await runPublish(new Date('2026-08-10T07:31:00Z'))
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'empty-queue' }])
+    expect(itemRow()).toMatchObject({ status: 'pending', postedDate: null, attempts: 0 })
+    // The chosen time is left on the row: the queue page is what tells the
+    // owner it went by, and clearing it here would hide that.
+    expect(itemRow().scheduledAt).toBe(NINE)
+  })
+
+  it('publishes every due scheduled item in one run — there is no daily cap', async () => {
+    // Deliberately seeded so queue order, id order and TIME order all disagree:
+    // the run must go by the clock, which is the only order the owner sees.
+    seedItem({ id: 'c', position: 1, scheduledAt: new Date('2026-08-10T06:20:00Z') })
+    seedItem({ id: 'a', position: 2, scheduledAt: new Date('2026-08-10T06:10:00Z') })
+    seedItem({ id: 'b', position: 3, scheduledAt: NINE })
+    seedImage({ itemId: 'c' })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+
+    // 09:25 Istanbul: all three are due, none is past its grace window.
+    const report = await runPublish(new Date('2026-08-10T06:25:00Z'))
+
+    // Oldest first, and every one of them goes out.
+    expect(report.slots.map((s) => [s.itemId, s.index, s.outcome])).toEqual([
+      ['b', 540, 'posted'], ['a', 550, 'posted'], ['c', 560, 'posted'],
+    ])
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(3)
+  })
+
+  it('attempts the second due item even when the first one fails', async () => {
+    // Two scheduled items are two different posts at two different times, not
+    // one queue head being retried — so a failure on one must not cost the
+    // other its time.
+    seedItem({ id: 'a', position: 1, scheduledAt: NINE })
+    seedItem({ id: 'b', position: 2, scheduledAt: new Date('2026-08-10T06:10:00Z') })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+    const publish = spyClient(
+      vi.fn<(input: PublishInput) => Promise<PublishResult>>(async (input) => {
+        if (input.imageUrls[0].includes('hash1')) throw new InstagramError('media container failed')
+        return { igMediaId: 'ig-b', permalink: 'https://p/b' }
+      }),
+    )
+
+    const report = await runPublish(new Date('2026-08-10T06:15:00Z'))
+
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(report.slots.map((s) => [s.itemId, s.outcome])).toEqual([['a', 'error'], ['b', 'posted']])
+    expect(itemRow('a')).toMatchObject({ status: 'pending', attempts: 1, postedDate: null })
+    expect(itemRow('b')).toMatchObject({ status: 'posted' })
+  })
+
+  it('never spends an automatic slot on an item that carries its own time', async () => {
+    // 'a' is at the head of the queue and scheduled for tomorrow. The 10:00
+    // slot must reach past it — its time is already chosen.
+    seedItem({ id: 'a', position: 1, scheduledAt: new Date('2026-08-11T06:00:00Z') })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted', itemId: 'b' }])
+    expect(itemRow('a')).toMatchObject({ status: 'pending', postedDate: null })
+  })
+
+  it('does not let a scheduled post eat the day\'s slot allowance', async () => {
+    // The owner scheduled a post for 09:00 and it went out. The 10:00 slot is
+    // still owed a post: allowanceBy caps what the SLOTS may publish, and
+    // counting an explicitly scheduled post against it would turn "five posts
+    // tomorrow if I say so" into "the slots stop for the rest of the day".
+    seedItem({
+      id: 'done', position: 1, status: 'posted',
+      scheduledAt: NINE, postedDate: TODAY, slotIndex: NINE_INDEX,
+    })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'b' })
+    okFetch()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted', itemId: 'b' }])
+  })
+
+  it('still refuses a slot the day has already had its posts by, counting slot posts only', async () => {
+    // The other half of the same rule, unchanged: a post that went out THROUGH
+    // a slot still counts, so editing the times cannot buy the day an extra one.
+    seedItem({
+      id: 'done', position: 1, status: 'posted', postedDate: TODAY, slotIndex: 540,
+    })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'b' })
+    const publish = spyClient()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'over-quota' }])
+  })
+
+  it('reports the 10:00 slot as filled when a scheduled post already took 10:00', async () => {
+    // Same minute, one claim: the scheduled post IS the 10:00 post.
+    seedItem({ id: 'a', position: 1, scheduledAt: new Date('2026-08-10T07:00:00Z') })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots).toEqual([
+      { date: TODAY, index: 600, outcome: 'posted', itemId: 'a', scheduled: true },
+      { date: TODAY, index: 600, outcome: 'already-filled' },
+    ])
+    expect(itemRow('b')).toMatchObject({ status: 'pending', postedDate: null })
+  })
+
+  it('leaves a scheduled item with no caption alone, at no cost to its attempts', async () => {
+    seedItem({ caption: '   ', scheduledAt: NINE })
+    seedImage()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_09_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([
+      { date: TODAY, index: NINE_INDEX, outcome: 'missing-caption', itemId: 'a', scheduled: true },
+    ])
+    expect(itemRow()).toMatchObject({ attempts: 0, postedDate: null, status: 'pending' })
+  })
+
+  it('publishes a scheduled story that has no caption', async () => {
+    seedItem({ kind: 'story', caption: '', scheduledAt: NINE })
+    seedImage()
+    okFetch()
+
+    const report = await runPublish(AT_09_05)
+
+    expect(report.slots[0]).toMatchObject({ outcome: 'posted', itemId: 'a', scheduled: true })
+  })
+
+  it('releases the claim and counts the attempt when the publish fails', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    spyClient(okPublish().mockRejectedValue(new InstagramError('media container failed')))
+
+    const report = await runPublish(AT_09_05)
+
+    expect(report.slots).toEqual([
+      { date: TODAY, index: NINE_INDEX, outcome: 'error', itemId: 'a', scheduled: true },
+    ])
+    expect(itemRow()).toMatchObject({
+      status: 'pending', attempts: 1, postedDate: null, slotIndex: null,
+      error: 'media container failed',
+    })
+    // Its time survives, so the next tick inside the grace window retries it.
+    expect(itemRow().scheduledAt).toBe(NINE)
+  })
+
+  it('is retried by the next tick while the window is still open', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    spyClient(okPublish().mockRejectedValue(new InstagramError('transient')))
+    await runPublish(AT_09_05)
+
+    okFetch()
+    clientOverride.value = null
+    const second = await runPublish(new Date('2026-08-10T06:20:00Z'))
+
+    expect(second.slots).toEqual([
+      { date: TODAY, index: NINE_INDEX, outcome: 'posted', itemId: 'a', scheduled: true },
+    ])
+    expect(itemRow()).toMatchObject({ status: 'posted', attempts: 1, error: null })
+  })
+
+  it('never rolls a scheduled post back once Instagram has it', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+    state.failUpdate = (t) => (t.values?.status === 'posted' ? new Error('connection reset') : null)
+
+    const report = await runPublish(AT_09_05)
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(report.slots).toEqual([
+      { date: TODAY, index: NINE_INDEX, outcome: 'posted-unrecorded', itemId: 'a', scheduled: true },
+    ])
+    expect(itemRow()).toMatchObject({ postedDate: TODAY, slotIndex: NINE_INDEX, attempts: 0 })
+
+    // And the next tick, still inside the window, must not publish it again:
+    // the claim it holds excludes it from the due query.
+    state.failUpdate = null
+    const publish2 = spyClient()
+    const second = await runPublish(new Date('2026-08-10T06:20:00Z'))
+    expect(publish2).not.toHaveBeenCalled()
+    expect(second.slots).toEqual([])
+  })
+
+  it('does nothing at all for a scheduled item when the dry-run opt-in is absent', async () => {
+    delete process.env.ALLOW_DRYRUN_PUBLISH
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+
+    expect(await runPublish(AT_09_05)).toEqual({ slots: [], dryRun: true, disabled: true })
+    expect(itemRow()).toMatchObject({ status: 'pending', postedDate: null })
+  })
+
+  // `scheduled_at` is a plain nullable timestamp column read straight out of
+  // the driver. A value that is not a usable instant must cost ONE item, not
+  // the whole tick: an unguarded one reaches `at.getTime()` (TypeError) or
+  // `localDate` (RangeError) and the run dies before it looks at a single slot.
+  it.each([
+    ['an invalid date', new Date('nonsense')],
+    ['a string the driver did not map', '2026-08-10T06:00:00Z'],
+    ['a number of milliseconds', 1_775_000_000_000],
+  ])('survives %s in scheduled_at, and still fills the slot', async (_label, value) => {
+    seedItem({ id: 'bad', position: 1, scheduledAt: value })
+    seedItem({ id: 'b', position: 2 })
+    seedImage({ itemId: 'bad' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+
+    const report = await runPublish(AT_10_05)
+
+    expect(report.slots).toEqual([{ date: TODAY, index: 600, outcome: 'posted', itemId: 'b' }])
+    expect(itemRow('bad')).toMatchObject({ status: 'pending', postedDate: null })
+  })
+})
+
+describe('runPublish — two cron runs racing on a scheduled item', () => {
+  // The property this whole task turns on: overlapping cron runs must publish a
+  // scheduled item EXACTLY ONCE. Proven the same way the slot path is, against
+  // a fake that evaluates where clauses and enforces items_slot_unique_idx.
+  it('publishes exactly once when two runs start together', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+
+    const [first, second] = await Promise.all([runPublish(AT_09_05), runPublish(AT_09_05)])
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect([first.slots[0].outcome, second.slots[0].outcome].sort()).toEqual(['posted', 'race-lost'])
+    expect(state.items.filter((r) => r.postedDate !== null)).toHaveLength(1)
+    expect(itemRow()).toMatchObject({ status: 'posted', slotIndex: NINE_INDEX, attempts: 0 })
+  })
+
+  it('publishes exactly once across four simultaneous runs', async () => {
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    okFetch()
+    const publish = spyClient()
+
+    const reports = await Promise.all([
+      runPublish(AT_09_05), runPublish(AT_09_05), runPublish(AT_09_05), runPublish(AT_09_05),
+    ])
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(reports.filter((r) => r.slots[0].outcome === 'posted')).toHaveLength(1)
+    expect(state.items.filter((r) => r.postedDate !== null)).toHaveLength(1)
+  })
+
+  it('publishes exactly once when two runs race on several scheduled items at once', async () => {
+    seedItem({ id: 'a', position: 1, scheduledAt: NINE })
+    seedItem({ id: 'b', position: 2, scheduledAt: new Date('2026-08-10T06:10:00Z') })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+    const publish = spyClient()
+
+    await Promise.all([
+      runPublish(new Date('2026-08-10T06:15:00Z')),
+      runPublish(new Date('2026-08-10T06:15:00Z')),
+    ])
+
+    expect(publish).toHaveBeenCalledTimes(2)
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(2)
+  })
+
+  it('treats a claim that matches no rows as a lost race, not as permission to post', async () => {
+    // Another run committed its claim between our read and our write. The
+    // UPDATE matches zero rows and throws nothing; only .returning() sees it.
+    seedItem({ scheduledAt: NINE })
+    seedImage()
+    const publish = spyClient()
+    state.beforeUpdate = (values) => {
+      if (values.postedDate) {
+        state.beforeUpdate = null
+        itemRow().postedDate = TODAY
+        itemRow().slotIndex = 1
+      }
+    }
+
+    const report = await runPublish(AT_09_05)
+
+    expect(publish).not.toHaveBeenCalled()
+    expect(report.slots).toEqual([
+      { date: TODAY, index: NINE_INDEX, outcome: 'race-lost', itemId: 'a', scheduled: true },
+    ])
+    expect(itemRow()).toMatchObject({ status: 'pending', attempts: 0, error: null })
+  })
+
+  it('gives the minute to one of two items that want it and refuses the other', async () => {
+    // The collision the queue page has to prevent, seen from the publisher's
+    // side: two items on the same minute of the same day are ONE claim, and the
+    // unique index is what says so.
+    seedItem({ id: 'a', position: 1, scheduledAt: NINE })
+    seedItem({ id: 'b', position: 2, scheduledAt: NINE })
+    seedImage({ itemId: 'a' })
+    seedImage({ itemId: 'b' })
+    okFetch()
+    const publish = spyClient()
+
+    const report = await runPublish(AT_09_05)
+
+    expect(publish).toHaveBeenCalledTimes(1)
+    expect(report.slots.map((s) => s.outcome).sort()).toEqual(['posted', 'race-lost'])
+    expect(state.items.filter((r) => r.status === 'posted')).toHaveLength(1)
+    const loser = state.items.find((r) => r.status === 'pending')!
+    expect(loser).toMatchObject({ postedDate: null, attempts: 0, error: null })
   })
 })

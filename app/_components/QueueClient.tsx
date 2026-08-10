@@ -15,7 +15,8 @@ import {
   nextCaptionlessId,
   queueStatus,
   resolveViewSettings,
-  slotLabels,
+  cardTimes,
+  takenScheduleKeys,
   type Note,
   type ViewItem,
   type ViewSettings,
@@ -102,6 +103,25 @@ export function QueueClient({
   const onCaptionSaved = useCallback((id: string, caption: string) => {
     setItems((prev) => prev.map((i) => (i.id === id ? { ...i, caption } : i)))
   }, [])
+
+  /**
+   * A saved time updates the local row, exactly as a caption does: the card's
+   * label, the banners and the minutes the OTHER cards are refused must all
+   * follow immediately, and a refetch would replace every card mid-edit.
+   */
+  const onScheduled = useCallback((id: string, scheduledAt: string | null) => {
+    setItems((prev) => prev.map((i) => (i.id === id ? { ...i, scheduledAt } : i)))
+  }, [])
+
+  /**
+   * The minutes every OTHER card holds. Computed when a card commits rather
+   * than on every render, and always from the current queue — a set captured at
+   * render time would go stale the moment another card saved a time.
+   */
+  const takenKeysFor = useCallback(
+    (id: string) => takenScheduleKeys(items, settings.timezone, id),
+    [items, settings.timezone],
+  )
 
   /**
    * `⌘↵` jumps to the next caption-less card, found by element id.
@@ -314,8 +334,9 @@ export function QueueClient({
   // on the queue would keep showing "Bugün 20:00" for a slot that passed an
   // hour ago; and both functions are a single pass over a queue of at most a
   // few hundred rows.
-  const status = queueStatus(items, settings)
-  const labels = slotLabels(items, settings, new Date())
+  const now = new Date()
+  const status = queueStatus(items, settings, now)
+  const times = cardTimes(items, settings, now)
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-8">
@@ -343,6 +364,8 @@ export function QueueClient({
         captionsTooLong={status.captionsTooLong}
         unrecorded={status.unrecordedIds.length}
         failed={status.failedIds.length}
+        missed={status.missedIds.length}
+        scheduledBlocked={status.scheduledBlocked}
         daysLeft={status.daysLeft}
         waiting={status.waiting}
         notes={notes}
@@ -362,7 +385,9 @@ export function QueueClient({
 
       <QueueGrid
           items={items}
-          slotLabels={labels}
+          times={times}
+          timezone={settings.timezone}
+          takenKeysFor={takenKeysFor}
           selected={selected}
           onSelect={(id, on) =>
             setSelected((prev) => {
@@ -373,6 +398,7 @@ export function QueueClient({
             })
           }
           onCaptionSaved={onCaptionSaved}
+          onScheduled={onScheduled}
           onAdvance={onAdvance}
         onReorder={onReorder}
       />

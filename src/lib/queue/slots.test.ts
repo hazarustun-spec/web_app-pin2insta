@@ -1,6 +1,9 @@
 // src/lib/queue/slots.test.ts
 import { describe, it, expect } from 'vitest'
-import { slotAt, dueSlots, upcomingSlots, slotIndexFor, slotTimeFor } from './slots'
+import {
+  slotAt, dueSlots, upcomingSlots, slotIndexFor, slotTimeFor,
+  localTime, startOfMinute, scheduledRef, dueState, DUE_GRACE_MINUTES,
+} from './slots'
 
 const TZ = 'Europe/Istanbul'
 const SLOTS = ['10:00', '14:00', '20:00']
@@ -138,5 +141,100 @@ describe('slotTimeFor — the inverse, so nothing the owner reads ever says "slo
     expect(slotTimeFor(-1)).toBe(null)
     expect(slotTimeFor(6.5)).toBe(null)
     expect(slotTimeFor(NaN)).toBe(null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 14: a per-post time is claimed in exactly the same space as a slot.
+// ---------------------------------------------------------------------------
+
+describe('localTime — the wall-clock time of an instant in the configured zone', () => {
+  it('reads an instant in the zone the schedule runs in, not the machine\'s', () => {
+    // 11:35 UTC is 14:35 in Istanbul and 13:35 in Berlin.
+    expect(localTime(new Date('2026-08-10T11:35:00Z'), TZ)).toBe('14:35')
+    expect(localTime(new Date('2026-08-10T11:35:00Z'), 'Europe/Berlin')).toBe('13:35')
+  })
+
+  it('zero-pads, and says 00:00 rather than 24:00 at local midnight', () => {
+    expect(localTime(new Date('2026-08-09T21:00:00Z'), TZ)).toBe('00:00')
+    expect(localTime(new Date('2026-08-10T06:09:00Z'), TZ)).toBe('09:09')
+  })
+
+  it('round-trips with slotAt for every minute of a day', () => {
+    for (let i = 0; i < 1440; i += 7) {
+      const time = slotTimeFor(i)!
+      expect(localTime(slotAt('2026-08-10', time, TZ), TZ)).toBe(time)
+    }
+  })
+})
+
+describe('startOfMinute — a scheduled time is stored to the minute', () => {
+  it('drops seconds and milliseconds', () => {
+    expect(startOfMinute(new Date('2026-08-10T11:35:47.123Z')).toISOString())
+      .toBe('2026-08-10T11:35:00.000Z')
+  })
+
+  it('leaves an already-truncated instant alone', () => {
+    const at = new Date('2026-08-10T11:35:00.000Z')
+    expect(startOfMinute(at).toISOString()).toBe(at.toISOString())
+  })
+})
+
+describe('scheduledRef — the claim a scheduled item makes', () => {
+  it('is the local date and the minute of that day, the same key a slot uses', () => {
+    const ref = scheduledRef(new Date('2026-08-10T11:35:00Z'), TZ)
+    expect(ref).toEqual({
+      date: '2026-08-10',
+      time: '14:35',
+      index: slotIndexFor('14:35'),
+      at: new Date('2026-08-10T11:35:00Z'),
+    })
+  })
+
+  it('gives a time that lands on a configured slot THE SAME index that slot has', () => {
+    // This is why two items cannot share a minute, and why a scheduled post at
+    // 10:00 fills the 10:00 slot rather than posting beside it.
+    const ref = scheduledRef(slotAt('2026-08-10', '10:00', TZ), TZ)
+    expect(ref.index).toBe(slotIndexFor('10:00'))
+    expect(ref.date).toBe('2026-08-10')
+  })
+
+  it('uses the local date, not the UTC one', () => {
+    // 22:30 UTC is already 01:30 the NEXT day in Istanbul.
+    expect(scheduledRef(new Date('2026-08-10T22:30:00Z'), TZ)).toMatchObject({
+      date: '2026-08-11', time: '01:30',
+    })
+  })
+
+  it('truncates a stray second, so two instants in one minute cannot differ', () => {
+    const a = scheduledRef(new Date('2026-08-10T11:35:00Z'), TZ)
+    const b = scheduledRef(new Date('2026-08-10T11:35:59.999Z'), TZ)
+    expect(b.at.getTime()).toBe(a.at.getTime())
+    expect(b.index).toBe(a.index)
+  })
+})
+
+describe('dueState — a scheduled time is due for exactly as long as a slot is', () => {
+  const at = new Date('2026-08-10T11:00:00Z') // 14:00 Istanbul
+
+  it('is early before the minute arrives', () => {
+    expect(dueState(at, new Date('2026-08-10T10:59:59Z'))).toBe('early')
+  })
+
+  it('is due from the minute itself to the end of the grace window', () => {
+    expect(dueState(at, at)).toBe('due')
+    expect(dueState(at, new Date(at.getTime() + DUE_GRACE_MINUTES * 60_000))).toBe('due')
+  })
+
+  it('is missed one millisecond past the window, and never rolls forward', () => {
+    expect(dueState(at, new Date(at.getTime() + DUE_GRACE_MINUTES * 60_000 + 1))).toBe('missed')
+    expect(dueState(at, new Date(at.getTime() + 86_400_000))).toBe('missed')
+  })
+
+  it('uses the same window dueSlots does', () => {
+    // 90 minutes, in one place, so a scheduled time and a slot cannot drift.
+    const now = new Date(at.getTime() + DUE_GRACE_MINUTES * 60_000)
+    expect(dueSlots(now, ['14:00'], TZ).map((s) => s.time)).toEqual(['14:00'])
+    expect(dueState(at, now)).toBe('due')
   })
 })

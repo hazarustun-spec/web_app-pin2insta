@@ -12,6 +12,16 @@ export const items = pgTable('items', {
   error: text('error'),
   postedDate: date('posted_date'),
   slotIndex: integer('slot_index'),
+  /**
+   * The owner's own time for this post, or NULL for "use the next free slot".
+   *
+   * Stored to the minute (see `startOfMinute`), because the minute is the
+   * item's claim: at publish time it becomes (posted_date, slot_index) exactly
+   * as a slot does, so `items_slot_unique_idx` covers a scheduled post and an
+   * automatic one with the same key. Every row that existed before this column
+   * holds NULL and keeps behaving exactly as it did.
+   */
+  scheduledAt: timestamp('scheduled_at', { withTimezone: true }),
   igMediaId: text('ig_media_id'),
   permalink: text('permalink'),
   postedAt: timestamp('posted_at', { withTimezone: true }),

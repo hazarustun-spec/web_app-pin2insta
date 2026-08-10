@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest'
 import {
+  chooseSchedule,
+  chosenTimeFor,
+  scheduleInputValue,
+  parseScheduleInput,
+  scheduleKeyFor,
+  takenScheduleKeys,
+  scheduleProblem,
   DEFAULT_VIEW_SETTINGS,
   resolveViewSettings,
   slugForStaging,
@@ -8,7 +15,7 @@ import {
   isUnrecorded,
   awaitsSlot,
   labelForSlot,
-  slotLabels,
+  cardTimes,
   queueStatus,
   composedCaption,
   captionTooLong,
@@ -29,6 +36,9 @@ import { upcomingSlots } from './slots'
 /** The exact regex `app/api/blob/upload/route.ts` answers 400 for. */
 const STAGING_PATH = /^tmp\/[A-Za-z0-9._-]{1,160}$/
 
+/** 2026-08-09 08:00 Europe/Istanbul — before every slot of the test day. */
+const NOW = new Date('2026-08-09T05:00:00Z')
+
 const SETTINGS: ViewSettings = {
   slots: ['10:00', '14:00', '20:00'], timezone: 'Europe/Istanbul', hashtags: '',
 }
@@ -42,6 +52,7 @@ function item(over: Partial<ViewItem> & { id: string }): ViewItem {
     error: null,
     postedDate: null,
     slotIndex: null,
+    scheduledAt: null,
     images: [{ url: 'https://example.invalid/a.jpg' }],
     ...over,
   }
@@ -157,8 +168,10 @@ describe('slot labels', () => {
 
   it('hands consecutive slots to the queue in order', () => {
     const items = [item({ id: 'a' }), item({ id: 'b' }), item({ id: 'c' }), item({ id: 'd' })]
-    const labels = slotLabels(items, SETTINGS, now)
-    expect([...labels.values()]).toEqual(['Bugün 10:00', 'Bugün 14:00', 'Bugün 20:00', 'Yarın 10:00'])
+    const labels = cardTimes(items, SETTINGS, now)
+    expect([...labels.values()].map((t) => t.text))
+      .toEqual(['Bugün 10:00', 'Bugün 14:00', 'Bugün 20:00', 'Yarın 10:00'])
+    expect([...labels.values()].every((t) => t.kind === 'slot' && !t.warn)).toBe(true)
   })
 
   it('spends no slot on a failed or posted-unrecorded item', () => {
@@ -167,11 +180,11 @@ describe('slot labels', () => {
       item({ id: 'dead', status: 'failed' }),
       item({ id: 'live' }),
     ]
-    const labels = slotLabels(items, SETTINGS, now)
+    const labels = cardTimes(items, SETTINGS, now)
     expect(labels.has('stuck')).toBe(false)
     expect(labels.has('dead')).toBe(false)
     // The first real slot goes to the first item that can actually use it.
-    expect(labels.get('live')).toBe('Bugün 10:00')
+    expect(labels.get('live')?.text).toBe('Bugün 10:00')
   })
 
   // The whole point of the label is telling the owner when a post goes out.
@@ -186,8 +199,8 @@ describe('slot labels', () => {
       item({ id: 'c' }),
       item({ id: 'd' }),
     ]
-    const labels = slotLabels(items, SETTINGS, now)
-    expect(labels.get('a')).toBe('Bugün 10:00')
+    const labels = cardTimes(items, SETTINGS, now)
+    expect(labels.get('a')?.text).toBe('Bugün 10:00')
     expect(labels.has('blocker')).toBe(false)
     expect(labels.has('c')).toBe(false)
     expect(labels.has('d')).toBe(false)
@@ -195,20 +208,20 @@ describe('slot labels', () => {
 
   it('labels the whole queue again once the blocker is captioned', () => {
     const items = [item({ id: 'a' }), item({ id: 'b' }), item({ id: 'c' })]
-    expect([...slotLabels(items, SETTINGS, now).keys()]).toEqual(['a', 'b', 'c'])
+    expect([...cardTimes(items, SETTINGS, now).keys()]).toEqual(['a', 'b', 'c'])
   })
 
   it('labels nothing at all when the head itself is uncaptioned', () => {
     const items = [item({ id: 'head', caption: '' }), item({ id: 'b' })]
-    expect(slotLabels(items, SETTINGS, now).size).toBe(0)
+    expect(cardTimes(items, SETTINGS, now).size).toBe(0)
   })
 
   // A story publishes without a caption, so it does not block anything.
   it('does not treat an uncaptioned story as a blockage', () => {
     const items = [item({ id: 'a', kind: 'story', caption: '' }), item({ id: 'b' })]
-    const labels = slotLabels(items, SETTINGS, now)
-    expect(labels.get('a')).toBe('Bugün 10:00')
-    expect(labels.get('b')).toBe('Bugün 14:00')
+    const labels = cardTimes(items, SETTINGS, now)
+    expect(labels.get('a')?.text).toBe('Bugün 10:00')
+    expect(labels.get('b')?.text).toBe('Bugün 14:00')
   })
 })
 
@@ -216,7 +229,7 @@ describe('queueStatus', () => {
   it('names the head when the head is what is blocking', () => {
     const blocked = queueStatus(
       [item({ id: 'a', caption: '' }), item({ id: 'b' }), item({ id: 'c', caption: '' })],
-      SETTINGS,
+      SETTINGS, NOW,
     )
     expect(blocked.headBlockedId).toBe('a')
     expect(blocked.missingCaptions).toBe(2)
@@ -225,7 +238,7 @@ describe('queueStatus', () => {
     // scheduler keeps running, so this is not the same emergency.
     const running = queueStatus(
       [item({ id: 'a' }), item({ id: 'b', caption: '' })],
-      SETTINGS,
+      SETTINGS, NOW,
     )
     expect(running.headBlockedId).toBe(null)
     expect(running.missingCaptions).toBe(1)
@@ -236,7 +249,7 @@ describe('queueStatus', () => {
     // is the real head.
     const s = queueStatus(
       [item({ id: 'stuck', caption: '', postedDate: '2026-08-08' }), item({ id: 'b' })],
-      SETTINGS,
+      SETTINGS, NOW,
     )
     expect(s.headBlockedId).toBe(null)
     expect(s.unrecordedIds).toEqual(['stuck'])
@@ -253,20 +266,20 @@ describe('queueStatus', () => {
         item({ id: 'dead', caption: '', status: 'failed' }),
         item({ id: 'real', caption: '' }),
       ],
-      SETTINGS,
+      SETTINGS, NOW,
     )
     expect(s.missingCaptions).toBe(1)
   })
 
   it('counts days left at the configured rate', () => {
     const seven = Array.from({ length: 7 }, (_, i) => item({ id: `i${i}` }))
-    expect(queueStatus(seven, SETTINGS).daysLeft).toBe(2)
-    expect(queueStatus(seven, { ...SETTINGS, slots: ['09:00'] }).daysLeft).toBe(7)
-    expect(queueStatus([], SETTINGS).daysLeft).toBe(0)
+    expect(queueStatus(seven, SETTINGS, NOW).daysLeft).toBe(2)
+    expect(queueStatus(seven, { ...SETTINGS, slots: ['09:00'] }, NOW).daysLeft).toBe(7)
+    expect(queueStatus([], SETTINGS, NOW).daysLeft).toBe(0)
   })
 
   it('lists failed items separately', () => {
-    const s = queueStatus([item({ id: 'x', status: 'failed', error: 'boom' })], SETTINGS)
+    const s = queueStatus([item({ id: 'x', status: 'failed', error: 'boom' })], SETTINGS, NOW)
     expect(s.failedIds).toEqual(['x'])
     expect(s.waiting).toBe(0)
   })
@@ -389,7 +402,7 @@ describe('the fixed hashtag block is part of what the page can see', () => {
   })
 
   it('names a too-long head as a blockage of its own kind', () => {
-    const s = queueStatus([item({ id: 'head', caption: `${exact}x` }), item({ id: 'b' })], withTags)
+    const s = queueStatus([item({ id: 'head', caption: `${exact}x` }), item({ id: 'b' })], withTags, NOW)
     expect(s.headBlockedId).toBe('head')
     expect(s.headBlockedReason).toBe('caption-too-long')
     expect(s.missingCaptions).toBe(0)
@@ -397,12 +410,12 @@ describe('the fixed hashtag block is part of what the page can see', () => {
   })
 
   it('still calls a missing caption a missing caption', () => {
-    const s = queueStatus([item({ id: 'head', caption: '' })], withTags)
+    const s = queueStatus([item({ id: 'head', caption: '' })], withTags, NOW)
     expect(s.headBlockedReason).toBe('missing-caption')
   })
 
   it('reports no blockage when nothing is wrong', () => {
-    const s = queueStatus([item({ id: 'a' })], withTags)
+    const s = queueStatus([item({ id: 'a' })], withTags, NOW)
     expect(s.headBlockedReason).toBe(null)
     expect(s.headBlockedId).toBe(null)
     expect(s.captionsTooLong).toBe(0)
@@ -417,12 +430,12 @@ describe('the fixed hashtag block is part of what the page can see', () => {
       item({ id: 'c' }),
     ]
     const now = new Date('2026-08-09T05:00:00Z')
-    const labels = slotLabels(items, withTags, now)
-    expect(labels.get('a')).toBe('Bugün 10:00')
+    const labels = cardTimes(items, withTags, now)
+    expect(labels.get('a')?.text).toBe('Bugün 10:00')
     expect(labels.has('blocker')).toBe(false)
     expect(labels.has('c')).toBe(false)
     // The same queue with no hashtags configured runs to the end.
-    expect([...slotLabels(items, SETTINGS, now).keys()]).toEqual(['a', 'blocker', 'c'])
+    expect([...cardTimes(items, SETTINGS, now).keys()]).toEqual(['a', 'blocker', 'c'])
   })
 })
 
@@ -474,5 +487,298 @@ describe('pastedPinUrl', () => {
     ['an empty clipboard', ''],
   ])('ignores %s', (_label, text) => {
     expect(pastedPinUrl(text)).toBe(null)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 14: an item may carry its own date and time. Empty still means "the next
+// free slot"; a chosen time is claimed, missed, or blocked — and the card has
+// to say which.
+// ---------------------------------------------------------------------------
+
+describe('a card that carries its own time', () => {
+  // 2026-08-09 08:00 Europe/Istanbul.
+  const now = NOW
+  /** 2026-08-09 14:35 Istanbul — later today, and not a configured slot. */
+  const LATER_TODAY = '2026-08-09T11:35:00.000Z'
+  /** 2026-08-09 06:00 Istanbul — two hours ago, well past the grace window. */
+  const GONE = '2026-08-09T03:00:00.000Z'
+
+  it('says the time is one the owner chose, not one the schedule computed', () => {
+    const labels = cardTimes([item({ id: 'a', scheduledAt: LATER_TODAY })], SETTINGS, now)
+    expect(labels.get('a')).toEqual({ text: 'Bugün 14:35 · seçilen saat', kind: 'scheduled', warn: false })
+  })
+
+  it('reads the chosen time in the configured zone, not the browser\'s', () => {
+    const berlin: ViewSettings = { ...SETTINGS, timezone: 'Europe/Berlin' }
+    expect(cardTimes([item({ id: 'a', scheduledAt: LATER_TODAY })], berlin, now).get('a')?.text)
+      .toBe('Bugün 13:35 · seçilen saat')
+  })
+
+  it('does not spend an upcoming slot on it, and does not let it hold up the queue', () => {
+    // 'a' has its own time; the slots belong to the others, in their order.
+    const items = [
+      item({ id: 'a', scheduledAt: LATER_TODAY }),
+      item({ id: 'b' }),
+      item({ id: 'c' }),
+    ]
+    const labels = cardTimes(items, SETTINGS, now)
+    expect(labels.get('a')?.text).toBe('Bugün 14:35 · seçilen saat')
+    expect(labels.get('b')?.text).toBe('Bugün 10:00')
+    expect(labels.get('c')?.text).toBe('Bugün 14:00')
+  })
+
+  it('keeps labelling the slot queue past an uncaptioned item that has its own time', () => {
+    // An uncaptioned item with its own time costs only ITS time: the publisher
+    // never looks at it for a slot, so it is not the blockage an ordinary
+    // uncaptioned card is.
+    const items = [
+      item({ id: 'scheduled', caption: '', scheduledAt: LATER_TODAY }),
+      item({ id: 'b' }),
+    ]
+    const labels = cardTimes(items, SETTINGS, now)
+    expect(labels.get('b')?.text).toBe('Bugün 10:00')
+  })
+
+  it('warns that an uncaptioned chosen time will pass unused', () => {
+    // The publisher refuses a non-story with no caption, so this time comes and
+    // goes with nothing posted. Showing a bare "Bugün 14:35" would read as a
+    // promise.
+    const labels = cardTimes([item({ id: 'a', caption: '', scheduledAt: LATER_TODAY })], SETTINGS, now)
+    expect(labels.get('a')).toEqual({
+      text: 'Bugün 14:35 · açıklama yok, boş geçecek', kind: 'scheduled', warn: true,
+    })
+  })
+
+  it('warns the same way when the fixed hashtags push the caption over the limit', () => {
+    const TAGS = '#moda #stil'
+    const tooLong = 'x'.repeat(2200 - TAGS.length - 2 + 1)
+    const labels = cardTimes(
+      [item({ id: 'a', caption: tooLong, scheduledAt: LATER_TODAY })],
+      { ...SETTINGS, hashtags: TAGS },
+      now,
+    )
+    expect(labels.get('a')?.warn).toBe(true)
+    expect(labels.get('a')?.text).toContain('açıklama çok uzun')
+  })
+
+  it('says plainly that a time has gone by and nothing was posted', () => {
+    const labels = cardTimes([item({ id: 'a', scheduledAt: GONE })], SETTINGS, now)
+    expect(labels.get('a')).toEqual({
+      text: 'Bugün 06:00 · saati geçti, paylaşılmadı', kind: 'scheduled', warn: true,
+    })
+  })
+
+  it('still calls a time inside the grace window a time that is about to be used', () => {
+    // 89 minutes past 06:00: the next cron tick still publishes it.
+    const nowInside = new Date(Date.parse(GONE) + 89 * 60_000)
+    expect(cardTimes([item({ id: 'a', scheduledAt: GONE })], SETTINGS, nowInside).get('a'))
+      .toMatchObject({ text: 'Bugün 06:00 · seçilen saat', warn: false })
+  })
+
+  it('does not promise a slot minute an item has already taken for itself', () => {
+    // 10:00 Istanbul today is BOTH a configured slot and this item's chosen
+    // time. They are one claim: the publisher fills it from the chosen time and
+    // reports the slot `already-filled`, so the next card waits for 14:00.
+    const items = [
+      item({ id: 'a', scheduledAt: '2026-08-09T07:00:00.000Z' }),
+      item({ id: 'b' }),
+    ]
+    const labels = cardTimes(items, SETTINGS, now)
+    expect(labels.get('a')?.text).toBe('Bugün 10:00 · seçilen saat')
+    expect(labels.get('b')?.text).toBe('Bugün 14:00')
+  })
+
+  it('names tomorrow and a further date exactly as a slot label does', () => {
+    const tomorrow = cardTimes(
+      [item({ id: 'a', scheduledAt: '2026-08-10T11:35:00.000Z' })], SETTINGS, now,
+    )
+    expect(tomorrow.get('a')?.text).toBe('Yarın 14:35 · seçilen saat')
+    const later = cardTimes(
+      [item({ id: 'a', scheduledAt: '2026-08-12T11:35:00.000Z' })], SETTINGS, now,
+    )
+    expect(later.get('a')?.text).toBe('12 Ağu 14:35 · seçilen saat')
+  })
+
+  it('spends no time at all on an item no publish will ever reach', () => {
+    const items = [
+      item({ id: 'stuck', scheduledAt: LATER_TODAY, postedDate: '2026-08-08', slotIndex: 600 }),
+      item({ id: 'dead', status: 'failed', scheduledAt: LATER_TODAY }),
+    ]
+    expect(cardTimes(items, SETTINGS, now).size).toBe(0)
+  })
+
+  it('treats an unreadable scheduled_at as no chosen time rather than crashing', () => {
+    const items = [item({ id: 'a', scheduledAt: 'not a date' }), item({ id: 'b' })]
+    const labels = cardTimes(items, SETTINGS, now)
+    // It falls back to the slot queue, which is what the publisher does too.
+    expect(labels.get('a')?.text).toBe('Bugün 10:00')
+    expect(labels.get('b')?.text).toBe('Bugün 14:00')
+  })
+})
+
+describe('queueStatus with chosen times', () => {
+  const now = NOW
+  const LATER_TODAY = '2026-08-09T11:35:00.000Z'
+  const GONE = '2026-08-09T03:00:00.000Z'
+
+  it('counts an item with its own time separately from the slot queue', () => {
+    const s = queueStatus(
+      [item({ id: 'a', scheduledAt: LATER_TODAY }), item({ id: 'b' }), item({ id: 'c' })],
+      SETTINGS,
+      now,
+    )
+    expect(s.waiting).toBe(2)
+    expect(s.scheduledWaiting).toBe(1)
+    // Three slots a day and two items waiting on them.
+    expect(s.daysLeft).toBe(0)
+  })
+
+  it('names every time that has gone by', () => {
+    const s = queueStatus(
+      [item({ id: 'gone', scheduledAt: GONE }), item({ id: 'b', scheduledAt: LATER_TODAY })],
+      SETTINGS,
+      now,
+    )
+    expect(s.missedIds).toEqual(['gone'])
+  })
+
+  it('does not call a missed time a failure', () => {
+    // Nothing was attempted: it is not `failed`, and it is not an ordinary
+    // pending card either.
+    const s = queueStatus([item({ id: 'gone', scheduledAt: GONE })], SETTINGS, now)
+    expect(s.failedIds).toEqual([])
+    expect(s.unrecordedIds).toEqual([])
+    expect(s.waiting).toBe(0)
+  })
+
+  it('does not let an item with its own time be the blocked head', () => {
+    // The slot path never looks at it, so an uncaptioned scheduled card does
+    // not stop the queue the way an ordinary one does.
+    const s = queueStatus(
+      [item({ id: 'a', caption: '', scheduledAt: LATER_TODAY }), item({ id: 'b' })],
+      SETTINGS,
+      now,
+    )
+    expect(s.headBlockedId).toBe(null)
+    expect(s.missingCaptions).toBe(0)
+    expect(s.scheduledBlocked).toBe(1)
+  })
+
+  it('still names an ordinary uncaptioned head', () => {
+    const s = queueStatus(
+      [item({ id: 'a', scheduledAt: LATER_TODAY }), item({ id: 'b', caption: '' })],
+      SETTINGS,
+      now,
+    )
+    expect(s.headBlockedId).toBe('b')
+    expect(s.headBlockedReason).toBe('missing-caption')
+  })
+
+  it('does not count a missed time as one that will pass unused', () => {
+    // It already did. `scheduledBlocked` is about a time still to come.
+    const s = queueStatus([item({ id: 'a', caption: '', scheduledAt: GONE })], SETTINGS, now)
+    expect(s.scheduledBlocked).toBe(0)
+    expect(s.missedIds).toEqual(['a'])
+  })
+})
+
+describe('choosing a time: the same refusals on both sides of the wire', () => {
+  const now = NOW
+  const TZ = 'Europe/Istanbul'
+
+  it('renders an instant as the datetime-local value of the CONFIGURED zone', () => {
+    // The control shows the owner the time their posts go out in, not the time
+    // on the laptop they happen to be using.
+    expect(scheduleInputValue('2026-08-09T11:35:00.000Z', TZ)).toBe('2026-08-09T14:35')
+    expect(scheduleInputValue('2026-08-09T11:35:00.000Z', 'Europe/Berlin')).toBe('2026-08-09T13:35')
+    expect(scheduleInputValue(null, TZ)).toBe('')
+    expect(scheduleInputValue('nonsense', TZ)).toBe('')
+  })
+
+  it('parses that value back to the instant it names in the configured zone', () => {
+    expect(parseScheduleInput('2026-08-09T14:35', TZ)?.toISOString()).toBe('2026-08-09T11:35:00.000Z')
+    expect(parseScheduleInput('2026-08-09T14:35', 'Europe/Berlin')?.toISOString())
+      .toBe('2026-08-09T12:35:00.000Z')
+  })
+
+  it('round-trips whatever the control produces', () => {
+    for (const value of ['2026-01-01T00:00', '2026-08-09T14:35', '2026-12-31T23:59']) {
+      expect(scheduleInputValue(parseScheduleInput(value, TZ)!.toISOString(), TZ)).toBe(value)
+    }
+  })
+
+  it('refuses a value that is not a minute of a real day', () => {
+    for (const bad of ['', 'today', '2026-08-09', '2026-08-09T14', '2026-13-40T14:35', '2026-08-09T24:00']) {
+      expect(parseScheduleInput(bad, TZ)).toBe(null)
+    }
+  })
+
+  it('keys a chosen time by the date and minute the publisher will claim', () => {
+    // The SAME key the unique index enforces, so the page refuses the collision
+    // the publisher would otherwise discover at 14:35.
+    expect(scheduleKeyFor(new Date('2026-08-09T11:35:00Z'), TZ)).toBe('2026-08-09#875')
+    // Seconds are not part of the identity: two items 30 seconds apart are one
+    // claim, and the page must say so.
+    expect(scheduleKeyFor(new Date('2026-08-09T11:35:30Z'), TZ)).toBe('2026-08-09#875')
+  })
+
+  it('collects the minutes already spoken for, ignoring the card being edited', () => {
+    const items = [
+      item({ id: 'a', scheduledAt: '2026-08-09T11:35:00.000Z' }),
+      item({ id: 'b', scheduledAt: '2026-08-09T12:00:00.000Z' }),
+      item({ id: 'plain' }),
+      // A posted-unrecorded row holds a real claim on (date, index).
+      item({ id: 'stuck', postedDate: '2026-08-09', slotIndex: 600 }),
+    ]
+    expect(takenScheduleKeys(items, TZ, 'a')).toEqual(new Set(['2026-08-09#900', '2026-08-09#600']))
+    expect(takenScheduleKeys(items, TZ)).toEqual(
+      new Set(['2026-08-09#875', '2026-08-09#900', '2026-08-09#600']),
+    )
+  })
+
+  it('refuses a time that has already gone', () => {
+    expect(scheduleProblem(new Date(now.getTime() - 60_000), now, new Set(), TZ))
+      .toBe('geçmiş bir saat seçilemez')
+    // The current minute is still ahead of the next cron tick, so it is allowed.
+    expect(scheduleProblem(now, now, new Set(), TZ)).toBe(null)
+  })
+
+  it('refuses a minute another item already holds', () => {
+    const at = new Date('2026-08-09T11:35:00Z')
+    const taken = new Set([scheduleKeyFor(at, TZ)])
+    expect(scheduleProblem(at, now, taken, TZ)).toBe('bu dakika dolu — başka bir saat seçin')
+    // One minute later is free.
+    expect(scheduleProblem(new Date(at.getTime() + 60_000), now, taken, TZ)).toBe(null)
+    // And so is the same minute of the next day.
+    expect(scheduleProblem(new Date(at.getTime() + 86_400_000), now, taken, TZ)).toBe(null)
+  })
+
+  it('refuses a time no clock could produce', () => {
+    expect(scheduleProblem(new Date('nonsense'), now, new Set(), TZ)).toBe('geçersiz tarih veya saat')
+  })
+
+  it('turns what the control holds into what to send, or what to refuse', () => {
+    const taken = new Set([scheduleKeyFor(new Date('2026-08-09T11:35:00Z'), TZ)])
+    // Empty: back to the next free slot. This is how a missed time is cleared.
+    expect(chooseSchedule('', TZ, now, taken)).toEqual({ scheduledAt: null })
+    // A time that is free.
+    expect(chooseSchedule('2026-08-09T15:00', TZ, now, taken))
+      .toEqual({ scheduledAt: '2026-08-09T12:00:00.000Z' })
+    // The minute another card holds — the collision the publisher would
+    // otherwise answer with `race-lost` and nothing on screen.
+    expect(chooseSchedule('2026-08-09T14:35', TZ, now, taken))
+      .toEqual({ error: 'bu dakika dolu — başka bir saat seçin' })
+    expect(chooseSchedule('2026-08-09T07:00', TZ, now, taken))
+      .toEqual({ error: 'geçmiş bir saat seçilemez' })
+    expect(chooseSchedule('yarın', TZ, now, taken))
+      .toEqual({ error: 'geçersiz tarih veya saat' })
+  })
+
+  it('reads a stored time back out for the control', () => {
+    expect(chosenTimeFor(item({ id: 'a', scheduledAt: '2026-08-09T11:35:00.000Z' }))?.toISOString())
+      .toBe('2026-08-09T11:35:00.000Z')
+    expect(chosenTimeFor(item({ id: 'a' }))).toBe(null)
+    expect(chosenTimeFor(item({ id: 'a', scheduledAt: 'nonsense' }))).toBe(null)
   })
 })

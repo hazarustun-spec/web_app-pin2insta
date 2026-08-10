@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull } from 'drizzle-orm'
+import { and, asc, eq, isNotNull, isNull } from 'drizzle-orm'
 import { getDb } from '@/src/db'
 import { items, images, settings } from '@/src/db/schema'
 import { getInstagramClient } from '@/src/lib/instagram'
@@ -8,7 +8,7 @@ import {
 } from '@/src/lib/instagram/types'
 import { makeThumb } from '@/src/lib/images/process'
 import { uploadImage, deleteImage } from '@/src/lib/images/storage'
-import { dueSlots, slotIndexFor, type SlotRef } from './slots'
+import { dueSlots, dueState, scheduledRef, slotIndexFor, type SlotRef } from './slots'
 import { MAX_CAPTION_CHARS } from './repo'
 
 /** Retries per item before it is marked `failed` and stops blocking the queue. */
@@ -66,14 +66,28 @@ export function selectForSlot(pending: Candidate[], hashtags = ''): Selection {
   // Stable sort, so rows that tie on position keep the order the query gave.
   const next = [...pending].sort((a, b) => a.position - b.position)[0]
   if (!next) return { action: 'skip', reason: 'empty-queue' }
-  if (next.attempts >= MAX_ATTEMPTS) return { action: 'skip', reason: 'exhausted', itemId: next.id }
-  if (next.kind !== 'story' && !next.caption.trim()) {
-    return { action: 'skip', reason: 'missing-caption', itemId: next.id }
-  }
-  if (withHashtags(next.caption, hashtags).length > MAX_CAPTION_CHARS) {
-    return { action: 'skip', reason: 'caption-too-long', itemId: next.id }
-  }
-  return { action: 'publish', itemId: next.id }
+  const blocker = itemBlocker(next, hashtags)
+  return blocker
+    ? { action: 'skip', reason: blocker, itemId: next.id }
+    : { action: 'publish', itemId: next.id }
+}
+
+/**
+ * Why this item cannot publish right now, or null.
+ *
+ * Extracted from `selectForSlot` because an item that carries its own time is
+ * not selected from a queue — it IS the candidate — and the three reasons a
+ * post is refused must be the same for both kinds. A second copy would drift,
+ * and the drift would show up as a scheduled post that burned three attempts on
+ * a caption the slot path refuses for free.
+ */
+export function itemBlocker(
+  item: Candidate, hashtags: string,
+): Exclude<SkipReason, 'empty-queue'> | null {
+  if (item.attempts >= MAX_ATTEMPTS) return 'exhausted'
+  if (item.kind !== 'story' && !item.caption.trim()) return 'missing-caption'
+  if (withHashtags(item.caption, hashtags).length > MAX_CAPTION_CHARS) return 'caption-too-long'
+  return null
 }
 
 export type SchedulerSettings = { slots: string[]; timezone: string; hashtags: string }
@@ -168,7 +182,18 @@ export type SlotOutcome =
   | 'deferred'
   | SkipReason
 
-export type SlotResult = { date: string; index: number; outcome: SlotOutcome; itemId?: string }
+export type SlotResult = {
+  date: string
+  index: number
+  outcome: SlotOutcome
+  itemId?: string
+  /**
+   * Present only for an item that carried its own `scheduled_at`. Deliberately
+   * absent — not `false` — on an automatic slot, so the shape of every result
+   * this report has ever produced is unchanged.
+   */
+  scheduled?: true
+}
 
 export type PublishReport = {
   slots: SlotResult[]
@@ -278,59 +303,28 @@ export function allowanceBy(slots: string[], time: string): number {
   return slots.filter((s) => slotIndexFor(s) <= limit).length
 }
 
-async function runSlot(
+/**
+ * Publishes ONE item into ONE claim: (date, minute-of-day).
+ *
+ * This is the only code path that talks to Instagram, and both kinds of due
+ * work go through it — an automatic slot and an item carrying its own time.
+ * Having one copy is not tidiness: every guarantee below was found the hard
+ * way, and a second publish path would have to rediscover each of them.
+ *
+ *   1. the payload is validated BEFORE anything is claimed;
+ *   2. the claim is an UPDATE that reads back `.returning()`, because an UPDATE
+ *      matching zero rows throws nothing at all;
+ *   3. NOTHING after `client.publish()` returns may release the claim, count an
+ *      attempt, or set the item back to pending.
+ */
+async function publishInto(
   db: Db,
   client: InstagramClient,
   now: Date,
-  slot: SlotRef,
-  cfg: SchedulerSettings,
-  failedThisRun: ReadonlySet<string> = new Set(),
-): Promise<SlotResult> {
-  const at = (outcome: SlotOutcome, itemId?: string): SlotResult =>
-    itemId === undefined
-      ? { date: slot.date, index: slot.index, outcome }
-      : { date: slot.date, index: slot.index, outcome, itemId }
-
-  // One read answers both questions: has THIS slot published, and has the day
-  // already had everything the schedule allows by now?
-  const claims = await db.select({ slotIndex: items.slotIndex }).from(items)
-    .where(eq(items.postedDate, slot.date))
-  const used = claims
-    .map((r) => r.slotIndex)
-    .filter((i): i is number => typeof i === 'number')
-  if (used.includes(slot.index)) return at('already-filled')
-  if (used.length >= allowanceBy(cfg.slots, slot.time)) return at('over-quota')
-
-  // Exactly the columns selectForSlot needs, so real rows satisfy `Candidate`
-  // without a cast. The ordering is total (position ties are possible, because
-  // nextPosition's max+1 is not atomic) so the head of the queue is the same
-  // item on every tick.
-  const pending: Candidate[] = await db.select({
-    id: items.id,
-    caption: items.caption,
-    kind: items.kind,
-    attempts: items.attempts,
-    position: items.position,
-  }).from(items)
-    .where(and(eq(items.status, 'pending'), isNull(items.postedDate)))
-    .orderBy(asc(items.position), asc(items.createdAt), asc(items.id))
-
-  // A failure earlier in this same run leaves the item at the head of the queue
-  // with its attempt already spent. Leave the slot empty rather than spending
-  // the rest of the budget on the same outage.
-  if (pending.length > 0 && failedThisRun.has(pending[0].id)) {
-    return at('deferred', pending[0].id)
-  }
-
-  const decision = selectForSlot(pending, cfg.hashtags)
-  if (decision.action === 'skip') {
-    return decision.reason === 'empty-queue'
-      ? at('empty-queue')
-      : at(decision.reason, decision.itemId)
-  }
-  // selectForSlot returns the id of a row it was handed, so this always finds one.
-  const item = pending.find((p) => p.id === decision.itemId)!
-
+  item: Candidate,
+  claim: { date: string; index: number },
+  hashtags: string,
+): Promise<SlotOutcome> {
   const imgs: ImageRow[] = await db.select({ id: images.id, url: images.url, hash: images.hash })
     .from(images)
     .where(eq(images.itemId, item.id))
@@ -339,7 +333,7 @@ async function runSlot(
   const input: PublishInput = {
     kind: item.kind,
     imageUrls: imgs.map((i) => i.url),
-    caption: withHashtags(item.caption, cfg.hashtags),
+    caption: withHashtags(item.caption, hashtags),
   }
 
   // Pre-flight the exact payload BEFORE claiming anything. A shape validate()
@@ -351,7 +345,7 @@ async function runSlot(
     validate(input)
   } catch (e) {
     console.error('payload rejected before claiming a slot for item', item.id, e)
-    return at('invalid-payload', item.id)
+    return 'invalid-payload'
   }
 
   // Claim the slot before calling out, and READ BACK what was claimed.
@@ -364,17 +358,19 @@ async function runSlot(
   let claimed: { id: string }[]
   try {
     claimed = await db.update(items)
-      .set({ postedDate: slot.date, slotIndex: slot.index })
+      .set({ postedDate: claim.date, slotIndex: claim.index })
       .where(and(eq(items.id, item.id), isNull(items.postedDate), eq(items.status, 'pending')))
       .returning({ id: items.id })
   } catch (e) {
     // The unique index is the backstop for the other order: our read said the
     // slot was free, and another run filled it before this statement landed.
-    if (isSlotTaken(e)) return at('race-lost', item.id)
+    // It is also what stops two items scheduled to the same minute from both
+    // going out — that pair is ONE claim, and only one of them can hold it.
+    if (isSlotTaken(e)) return 'race-lost'
     console.error('slot claim failed for item', item.id, e)
-    return at('claim-failed', item.id)
+    return 'claim-failed'
   }
-  if (claimed.length === 0) return at('race-lost', item.id)
+  if (claimed.length === 0) return 'race-lost'
 
   let result: PublishResult
   try {
@@ -387,7 +383,7 @@ async function runSlot(
       // The claim survives, so the item is stuck rather than double-posted.
       console.error('could not record the failure for item', item.id, e2)
     }
-    return at('error', item.id)
+    return 'error'
   }
 
   // ── The post now EXISTS on Instagram and cannot be recalled. ──────────────
@@ -407,18 +403,168 @@ async function runSlot(
     // will not publish it again; the row simply lacks its permalink until
     // someone fixes it by hand.
     console.error('published but could not record it for item', item.id, e)
-    return at('posted-unrecorded', item.id)
+    return 'posted-unrecorded'
   }
 
   await refreshThumbnails(db, imgs)
-  return at('posted', item.id)
+  return 'posted'
+}
+
+async function runSlot(
+  db: Db,
+  client: InstagramClient,
+  now: Date,
+  slot: SlotRef,
+  cfg: SchedulerSettings,
+  failedThisRun: ReadonlySet<string> = new Set(),
+): Promise<SlotResult> {
+  const at = (outcome: SlotOutcome, itemId?: string): SlotResult =>
+    itemId === undefined
+      ? { date: slot.date, index: slot.index, outcome }
+      : { date: slot.date, index: slot.index, outcome, itemId }
+
+  // One read answers both questions: has THIS slot published, and has the day
+  // already had everything the schedule allows by now?
+  const claims = await db.select({ slotIndex: items.slotIndex, scheduledAt: items.scheduledAt })
+    .from(items)
+    .where(eq(items.postedDate, slot.date))
+  const used = claims
+    .map((r) => r.slotIndex)
+    .filter((i): i is number => typeof i === 'number')
+  if (used.includes(slot.index)) return at('already-filled')
+  // The allowance counts posts that went out THROUGH A SLOT, and only those. A
+  // post the owner gave its own time to is not one of the day's slot posts:
+  // counting it would make "five posts tomorrow if I schedule five" mean "the
+  // slots stop for the rest of the day", which is the opposite of no daily cap.
+  const bySlot = claims.filter((r) => r.scheduledAt == null && typeof r.slotIndex === 'number')
+  if (bySlot.length >= allowanceBy(cfg.slots, slot.time)) return at('over-quota')
+
+  // Exactly the columns selectForSlot needs, so real rows satisfy `Candidate`
+  // without a cast. The ordering is total (position ties are possible, because
+  // nextPosition's max+1 is not atomic) so the head of the queue is the same
+  // item on every tick.
+  //
+  // `isNull(items.scheduledAt)`: an item that carries its own time is NOT a
+  // candidate for a slot. Spending a slot on it would publish it at a time the
+  // owner did not choose, and would also consume the slot that the rest of the
+  // queue is waiting for.
+  const pending: Candidate[] = await db.select({
+    id: items.id,
+    caption: items.caption,
+    kind: items.kind,
+    attempts: items.attempts,
+    position: items.position,
+  }).from(items)
+    .where(and(
+      eq(items.status, 'pending'),
+      isNull(items.postedDate),
+      isNull(items.scheduledAt),
+    ))
+    .orderBy(asc(items.position), asc(items.createdAt), asc(items.id))
+
+  // A failure earlier in this same run leaves the item at the head of the queue
+  // with its attempt already spent. Leave the slot empty rather than spending
+  // the rest of the budget on the same outage.
+  if (pending.length > 0 && failedThisRun.has(pending[0].id)) {
+    return at('deferred', pending[0].id)
+  }
+
+  const decision = selectForSlot(pending, cfg.hashtags)
+  if (decision.action === 'skip') {
+    return decision.reason === 'empty-queue'
+      ? at('empty-queue')
+      : at(decision.reason, decision.itemId)
+  }
+  // selectForSlot returns the id of a row it was handed, so this always finds one.
+  const item = pending.find((p) => p.id === decision.itemId)!
+
+  return at(await publishInto(db, client, now, item, slot, cfg.hashtags), item.id)
+}
+
+/** A pending item the owner gave a time to, plus that time. */
+type ScheduledCandidate = Candidate & { scheduledAt: Date }
+
+/**
+ * Publishes one item at the time the owner chose for it.
+ *
+ * The claim is `scheduledRef`: the local date of `scheduled_at` and its minute
+ * of the day — the same two columns a slot claims, under the same unique index.
+ * So a scheduled post at 10:00 and the 10:00 slot cannot both go out, and two
+ * items scheduled to the same minute cannot either.
+ */
+async function runScheduled(
+  db: Db,
+  client: InstagramClient,
+  now: Date,
+  item: ScheduledCandidate,
+  cfg: SchedulerSettings,
+): Promise<SlotResult> {
+  const ref = scheduledRef(item.scheduledAt, cfg.timezone)
+  const at = (outcome: SlotOutcome): SlotResult =>
+    ({ date: ref.date, index: ref.index, outcome, itemId: item.id, scheduled: true })
+
+  // The same three refusals the slot path applies, from the same function — and
+  // like there, none of them costs an attempt or touches the row. The chosen
+  // time simply passes unused, which is what the queue page has to say.
+  const blocker = itemBlocker(item, cfg.hashtags)
+  if (blocker) return at(blocker)
+
+  return at(await publishInto(db, client, now, item, ref, cfg.hashtags))
 }
 
 /**
- * Publishes the head of the queue into every slot that is due and unfilled.
+ * Every pending item whose own time has arrived and has not yet gone stale,
+ * oldest first.
  *
- * Missed slots do not roll forward — `dueSlots` drops anything older than its
- * grace window, because catching up would post several times in an hour.
+ * The window is applied here rather than in SQL so that `dueState` is the ONLY
+ * definition of "due" in the codebase: the queue page calls the same function
+ * to decide whether to call a time missed, and a second rule expressed as a
+ * pair of SQL comparisons would be free to disagree with it. The rows this
+ * reads are only ever items the owner scheduled and that have not published.
+ */
+async function dueScheduled(db: Db, now: Date): Promise<ScheduledCandidate[]> {
+  const rows = await db.select({
+    id: items.id,
+    caption: items.caption,
+    kind: items.kind,
+    attempts: items.attempts,
+    position: items.position,
+    scheduledAt: items.scheduledAt,
+  }).from(items)
+    .where(and(
+      eq(items.status, 'pending'),
+      isNull(items.postedDate),
+      isNotNull(items.scheduledAt),
+    ))
+    .orderBy(asc(items.scheduledAt), asc(items.id))
+
+  const due: ScheduledCandidate[] = []
+  for (const row of rows) {
+    const scheduledAt = row.scheduledAt
+    // `scheduled_at` is a plain nullable timestamp column: a row written by
+    // hand can hold something no clock produced, and an Invalid Date makes
+    // `localDate` throw RangeError — which would take down the entire cron run,
+    // slots included, rather than cost this one item.
+    if (!(scheduledAt instanceof Date) || Number.isNaN(scheduledAt.getTime())) {
+      console.error('ignoring an unreadable scheduled_at on item', row.id)
+      continue
+    }
+    if (dueState(scheduledAt, now) === 'due') due.push({ ...row, scheduledAt })
+  }
+  return due
+}
+
+/**
+ * Publishes the due work of this tick, in two phases.
+ *
+ * 1. Items that carry their OWN time, oldest first, each into its own minute.
+ *    There is no cap: five posts scheduled for tomorrow are five posts.
+ * 2. The head of the queue into every slot that is due and unfilled, exactly as
+ *    before — minus the items phase 1 owns.
+ *
+ * Neither missed slots nor missed scheduled times roll forward: anything older
+ * than the shared grace window is dropped, because catching up would post
+ * several times in an hour at times nobody chose.
  */
 export async function runPublish(now: Date): Promise<PublishReport> {
   const db = getDb()
@@ -430,6 +576,16 @@ export async function runPublish(now: Date): Promise<PublishReport> {
   const cfg = resolveSettings(row)
 
   const slots: SlotResult[] = []
+
+  // Phase 1. Each of these is a different post at a different time, so unlike
+  // the slot loop below there is no failedThisRun guard: a failure on one is
+  // not a reason to spend another item's chosen time on the same outage. The
+  // two phases cannot collide over an item either — the slot query excludes
+  // everything with a `scheduled_at`.
+  for (const item of await dueScheduled(db, now)) {
+    slots.push(await runScheduled(db, client, now, item, cfg))
+  }
+
   // An item that just failed must not be retried again inside the same run.
   // Several slots can be due at once — closely spaced slot times, a cron tick
   // that arrives late, or the spring-forward gap where two wall-clock times

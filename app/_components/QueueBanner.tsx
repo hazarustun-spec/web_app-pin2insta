@@ -27,6 +27,8 @@ export function QueueBanner({
   captionsTooLong,
   unrecorded,
   failed,
+  missed,
+  scheduledBlocked,
   daysLeft,
   waiting,
   notes,
@@ -37,6 +39,10 @@ export function QueueBanner({
   captionsTooLong: number
   unrecorded: number
   failed: number
+  /** Items whose chosen time went by with nothing posted. */
+  missed: number
+  /** Items whose chosen time is still ahead but which cannot publish when it arrives. */
+  scheduledBlocked: number
   daysLeft: number
   waiting: number
   notes: Note[]
@@ -71,6 +77,24 @@ export function QueueBanner({
       )}
       {failed > 0 && (
         <Alarm>{failed} gönderi üç denemede de paylaşılamadı.</Alarm>
+      )}
+      {missed > 0 && (
+        // A missed time is invisible otherwise: nothing was attempted, so the
+        // item is not `failed`, and it looks exactly like an ordinary pending
+        // card — except no slot will ever be spent on it either, because it
+        // carries a time of its own. It waits forever until someone acts.
+        <Alarm>
+          {missed} gönderinin seçilen saati geçti — paylaşılmadı. Geçmiş bir saat ileri
+          taşınmaz: yeni bir saat seçin ya da saati kaldırın, sıradaki boş slota girsin.
+        </Alarm>
+      )}
+      {scheduledBlocked > 0 && (
+        // Its time is coming and it will pass with nothing posted — and no slot
+        // is spent instead, so this costs a post outright.
+        <Alarm>
+          {scheduledBlocked} gönderinin saati seçilmiş ama açıklaması yayına uygun değil —
+          o saat boş geçecek.
+        </Alarm>
       )}
       {missingCaptions > 0 && !headBlocked && (
         // NOT "skipped". selectForSlot only looks at the head and never steps

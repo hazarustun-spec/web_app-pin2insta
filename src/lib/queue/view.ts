@@ -1,4 +1,7 @@
-import { localDate, upcomingSlots, type SlotRef } from './slots'
+import {
+  dueState, localDate, localTime, scheduledRef, slotAt, startOfMinute, upcomingSlots,
+  type SlotRef,
+} from './slots'
 import { isPinUrl } from '../pinterest'
 
 /**
@@ -165,6 +168,16 @@ export type ViewItem = {
   error: string | null
   postedDate: string | null
   slotIndex: number | null
+  /**
+   * The owner's own time for this post as an ISO string, or null for "use the
+   * next free slot".
+   *
+   * A STRING, not a Date, because this row reaches the page two ways — the
+   * server component reads it from Drizzle and `load()` refetches it as JSON —
+   * and only one of those can carry a Date. `app/page.tsx` converts on the way
+   * in so the two agree; `chosenTimeFor` is the only thing that reads it.
+   */
+  scheduledAt: string | null
   images: { url: string }[]
 }
 
@@ -222,9 +235,146 @@ export function isUnrecorded(item: Pick<ViewItem, 'status' | 'postedDate'>): boo
   return item.status === 'pending' && item.postedDate !== null
 }
 
-/** True for an item a future slot will actually be spent on. */
+/** True for an item some future publish — a slot or its own time — will reach. */
 export function awaitsSlot(item: Pick<ViewItem, 'status' | 'postedDate'>): boolean {
   return item.status === 'pending' && item.postedDate === null
+}
+
+// ---------------------------------------------------------------------------
+// A time the owner chose for one post (Task 14)
+// ---------------------------------------------------------------------------
+
+/**
+ * The instant this item was scheduled for, or null for "use the next free slot".
+ *
+ * Returns null rather than an Invalid Date for anything unreadable, exactly as
+ * the publisher does: the column is a plain nullable timestamp, and an Invalid
+ * Date reaching `localDate` throws RangeError — here that would blank the whole
+ * queue page rather than one card's label.
+ */
+export function chosenTimeFor(item: Pick<ViewItem, 'scheduledAt'>): Date | null {
+  if (typeof item.scheduledAt !== 'string' || item.scheduledAt === '') return null
+  const at = new Date(item.scheduledAt)
+  return Number.isNaN(at.getTime()) ? null : at
+}
+
+/** True for an item that publishes at its own time rather than in the next free slot. */
+export function hasChosenTime(item: Pick<ViewItem, 'scheduledAt'>): boolean {
+  return chosenTimeFor(item) !== null
+}
+
+/** True for an item a future SLOT will be spent on — which excludes the ones with their own time. */
+export function usesSlot(item: Pick<ViewItem, 'status' | 'postedDate' | 'scheduledAt'>): boolean {
+  return awaitsSlot(item) && !hasChosenTime(item)
+}
+
+/**
+ * The claim a chosen time makes: `${local date}#${minute of that day}`.
+ *
+ * This is the key of `items_slot_unique_idx` written down. Two items on the
+ * same key are ONE claim and only one of them can publish, so the page refuses
+ * the second before it is saved rather than letting the publisher discover it
+ * at the minute itself and report `race-lost`.
+ */
+export function scheduleKeyFor(at: Date, timeZone: string): string {
+  const ref = scheduledRef(at, timeZone)
+  return `${ref.date}#${ref.index}`
+}
+
+/**
+ * Every minute already spoken for by another card: the times other items carry,
+ * plus the claims held by rows that have already taken one (a posted-unrecorded
+ * row still holds its slot).
+ *
+ * `exceptId` is the card being edited — moving it to the minute it already has
+ * must not be refused as a collision with itself.
+ */
+export type ScheduleRow = Pick<ViewItem, 'id' | 'status' | 'postedDate' | 'slotIndex' | 'scheduledAt'>
+
+export function takenScheduleKeys(
+  items: ScheduleRow[], timeZone: string, exceptId?: string,
+): Set<string> {
+  const keys = new Set<string>()
+  for (const i of items) {
+    if (i.id === exceptId) continue
+    if (i.postedDate !== null && i.slotIndex !== null) keys.add(`${i.postedDate}#${i.slotIndex}`)
+    if (!awaitsSlot(i)) continue
+    const at = chosenTimeFor(i)
+    if (at) keys.add(scheduleKeyFor(at, timeZone))
+  }
+  return keys
+}
+
+/**
+ * Why this time cannot be saved, in Turkish, or null.
+ *
+ * Exported so the card and `setScheduledAt` refuse with the SAME test. The
+ * server is the authority — a stale page cannot see a minute another tab just
+ * took — but the two must agree, or the owner is told one thing by the control
+ * and another by the response.
+ */
+export function scheduleProblem(
+  at: Date, now: Date, taken: Set<string>, timeZone: string,
+): string | null {
+  if (Number.isNaN(at.getTime())) return 'geçersiz tarih veya saat'
+  // Compared minute to minute: the minute that is running right now is still
+  // ahead of the next cron tick, so it is a legitimate choice.
+  if (startOfMinute(at).getTime() < startOfMinute(now).getTime()) {
+    return 'geçmiş bir saat seçilemez'
+  }
+  if (taken.has(scheduleKeyFor(at, timeZone))) return 'bu dakika dolu — başka bir saat seçin'
+  return null
+}
+
+/** `YYYY-MM-DDTHH:MM` in the configured zone — what a `datetime-local` input shows. */
+export function scheduleInputValue(iso: string | null, timeZone: string): string {
+  const at = chosenTimeFor({ scheduledAt: iso })
+  if (!at) return ''
+  return `${localDate(at, timeZone)}T${localTime(at, timeZone)}`
+}
+
+const INPUT_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/
+
+/**
+ * The instant `YYYY-MM-DDTHH:MM` names IN THE CONFIGURED ZONE, or null.
+ *
+ * Not `new Date(value)`, which reads the string in the BROWSER's zone: the
+ * owner types the time their account posts at, and a laptop in another country
+ * would silently shift every post they schedule.
+ *
+ * The range check is a round-trip rather than a set of bounds, because
+ * `TZDate` rolls over rather than refusing — month 13 becomes January, and
+ * 24:00 becomes midnight the next day. Anything that does not come back
+ * unchanged was not the time the caller wrote.
+ */
+export function parseScheduleInput(value: string, timeZone: string): Date | null {
+  if (!INPUT_RE.test(value)) return null
+  const [date, time] = value.split('T')
+  const at = slotAt(date, time, timeZone)
+  if (Number.isNaN(at.getTime())) return null
+  return localDate(at, timeZone) === date && localTime(at, timeZone) === time ? at : null
+}
+
+/** What to send for a `datetime-local` value, or the sentence to show instead. */
+export type ScheduleChoice = { scheduledAt: string | null } | { error: string }
+
+/**
+ * The whole decision the date-and-time control makes, as a pure function: what
+ * to PATCH, or what to refuse and why.
+ *
+ * Lives here rather than in the component so it can be tested in the node
+ * environment the rest of this module is, and so the three outcomes — clear it,
+ * send it, refuse it — are one thing to read.
+ */
+export function chooseSchedule(
+  value: string, timeZone: string, now: Date, taken: Set<string>,
+): ScheduleChoice {
+  // An empty control means "no time of my own": back to the next free slot.
+  if (value === '') return { scheduledAt: null }
+  const at = parseScheduleInput(value, timeZone)
+  if (!at) return { error: 'geçersiz tarih veya saat' }
+  const problem = scheduleProblem(at, now, taken, timeZone)
+  return problem ? { error: problem } : { scheduledAt: at.toISOString() }
 }
 
 /** Exported so the published-history page names months the same way this one does. */
@@ -256,36 +406,75 @@ export function labelForSlot(slot: SlotRef, settings: ViewSettings, now: Date): 
 }
 
 /**
+ * What one card says about when it goes out.
+ *
+ * `kind` distinguishes the two, because they are not the same promise: a slot
+ * is computed and moves as the queue in front of it changes, while a chosen
+ * time is the owner's and does not. `warn` marks a time that will NOT produce
+ * a post — one that has gone by, or one whose caption the publisher refuses.
+ */
+export type CardTime = { text: string; kind: 'slot' | 'scheduled'; warn: boolean }
+
+/** Why a chosen time will pass unused, in the words the card shows. */
+function unusableReason(item: ViewItem, settings: ViewSettings): string | null {
+  if (needsCaption(item)) return 'açıklama yok, boş geçecek'
+  if (captionTooLong(item, settings.hashtags)) return 'açıklama çok uzun, boş geçecek'
+  return null
+}
+
+/**
  * When each item goes out, by id.
  *
- * Slots are handed to items in queue order, up to the first item that cannot
- * use one. An uncaptioned item does not yield its turn — selectForSlot leaves
- * the slot empty and meets the same item at the head next tick — so nothing
- * behind it has a knowable time and this returns no label for it or for
- * anything after it. Items that are `failed` or posted-unrecorded are not
- * blockages: no slot is spent on them either, so labelling continues past.
+ * Two kinds of entry, and the card has to be able to tell them apart:
  *
- * Items that no slot will ever be spent on — `failed`, and `posted-unrecorded`
- * — are skipped entirely and get no entry.
+ * - an item carrying its own time gets THAT time, whatever the queue in front
+ *   of it is doing. It is not a blockage for anything else, because the
+ *   publisher never considers it for a slot;
+ * - everything else gets the next free slot, in queue order, exactly as before.
+ *   Slots are handed out up to the first item that cannot use one: an
+ *   uncaptioned item does not yield its turn — selectForSlot leaves the slot
+ *   empty and meets the same item at the head next tick — so nothing behind it
+ *   has a knowable time, and promising one would be a lie the owner acts on.
+ *
+ * Items no publish will ever reach — `failed`, and posted-unrecorded — get no
+ * entry at all.
  */
-export function slotLabels(
+export function cardTimes(
   items: ViewItem[], settings: ViewSettings, now: Date,
-): Map<string, string> {
+): Map<string, CardTime> {
   const waiting = items.filter(awaitsSlot)
-  // An uncaptioned item does not yield its turn — selectForSlot leaves the slot
-  // empty and finds the same item at the head on the next tick. So nothing
-  // below it has a knowable time, and promising one would be a lie the owner
-  // acts on. Label up to the blockage and no further. A caption the hashtag
-  // block pushes over 2200 characters blocks in exactly the same way.
-  const blocked = waiting.findIndex((i) => blocksQueue(i, settings))
-  const schedulable = blocked === -1 ? waiting : waiting.slice(0, blocked + 1)
-  const slots = upcomingSlots(now, settings.slots, settings.timezone, schedulable.length)
-  const out = new Map<string, string>()
+  const out = new Map<string, CardTime>()
+
+  // The minutes the chosen times have taken. Passed to upcomingSlots so the
+  // page does not promise a slot minute an item has already claimed for
+  // itself — the publisher would report that slot `already-filled`.
+  const claimed: SlotRef[] = []
+  for (const item of waiting) {
+    const at = chosenTimeFor(item)
+    if (!at) continue
+    const ref = scheduledRef(at, settings.timezone)
+    claimed.push(ref)
+    const when = labelForSlot(ref, settings, now)
+    const missed = dueState(ref.at, now) === 'missed'
+    const unusable = unusableReason(item, settings)
+    out.set(item.id, {
+      // A missed time is stated first: it already happened, so what the caption
+      // would have done no longer matters.
+      text: `${when} · ${missed ? 'saati geçti, paylaşılmadı' : unusable ?? 'seçilen saat'}`,
+      kind: 'scheduled',
+      warn: missed || unusable !== null,
+    })
+  }
+
+  const queued = waiting.filter((i) => !hasChosenTime(i))
+  const blocked = queued.findIndex((i) => blocksQueue(i, settings))
+  const schedulable = blocked === -1 ? queued : queued.slice(0, blocked + 1)
+  const slots = upcomingSlots(now, settings.slots, settings.timezone, schedulable.length, claimed)
   schedulable.forEach((item, i) => {
     const slot = slots[i]
     // upcomingSlots looks 400 days ahead and no further, so a queue longer than
     // that leaves the tail unlabelled rather than mislabelled.
-    if (slot) out.set(item.id, labelForSlot(slot, settings, now))
+    if (slot) out.set(item.id, { text: labelForSlot(slot, settings, now), kind: 'slot', warn: false })
   })
   // The blocking item itself has no time either: its slot is skipped.
   if (blocked !== -1) out.delete(schedulable[blocked].id)
@@ -293,8 +482,24 @@ export function slotLabels(
 }
 
 export type QueueStatus = {
-  /** Items a future slot will be spent on. */
+  /** Items a future SLOT will be spent on — not the ones carrying their own time. */
   waiting: number
+  /** Items that publish at a time the owner chose, and whose time is still ahead. */
+  scheduledWaiting: number
+  /**
+   * Items whose chosen time went by with nothing posted.
+   *
+   * Not `failed` — nothing was attempted — and not an ordinary pending card
+   * either, because its time has gone and a missed time does not roll forward.
+   * Invisible unless it is named.
+   */
+  missedIds: string[]
+  /**
+   * Items whose chosen time is still ahead but which the publisher will refuse
+   * when it arrives: no caption, or a caption the hashtag block pushes over
+   * 2200. Their time passes unused and no slot is spent instead.
+   */
+  scheduledBlocked: number
   /** Whole days of posting left at the configured rate. */
   daysLeft: number
   /** Uncaptioned items a slot would otherwise be spent on. */
@@ -319,19 +524,31 @@ export type QueueStatus = {
   failedIds: string[]
 }
 
-export function queueStatus(items: ViewItem[], settings: ViewSettings): QueueStatus {
-  const waiting = items.filter(awaitsSlot)
-  const head = waiting[0]
+export function queueStatus(
+  items: ViewItem[], settings: ViewSettings, now: Date,
+): QueueStatus {
+  // The slot queue and the chosen-time set are counted apart all the way down.
+  // An uncaptioned item with its own time is a real problem, but it is NOT the
+  // one the head-blocked banner describes: the publisher never looks at it for
+  // a slot, so it stops nothing behind it.
+  const queued = items.filter(usesSlot)
+  const chosen = items.filter((i) => awaitsSlot(i) && hasChosenTime(i))
+  const missed = chosen.filter((i) => dueState(chosenTimeFor(i)!, now) === 'missed')
+  const upcoming = chosen.filter((i) => dueState(chosenTimeFor(i)!, now) !== 'missed')
+  const head = queued[0]
   const headReason: QueueStatus['headBlockedReason'] =
     !head ? null
       : needsCaption(head) ? 'missing-caption'
         : captionTooLong(head, settings.hashtags) ? 'caption-too-long'
           : null
   return {
-    waiting: waiting.length,
-    daysLeft: Math.floor(waiting.length / Math.max(settings.slots.length, 1)),
-    missingCaptions: waiting.filter(needsCaption).length,
-    captionsTooLong: waiting.filter((i) => captionTooLong(i, settings.hashtags)).length,
+    waiting: queued.length,
+    scheduledWaiting: upcoming.length,
+    missedIds: missed.map((i) => i.id),
+    scheduledBlocked: upcoming.filter((i) => blocksQueue(i, settings)).length,
+    daysLeft: Math.floor(queued.length / Math.max(settings.slots.length, 1)),
+    missingCaptions: queued.filter(needsCaption).length,
+    captionsTooLong: queued.filter((i) => captionTooLong(i, settings.hashtags)).length,
     headBlockedId: headReason ? head.id : null,
     headBlockedReason: headReason,
     unrecordedIds: items.filter(isUnrecorded).map((i) => i.id),

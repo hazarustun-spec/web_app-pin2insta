@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { Card } from './Card'
-import type { ViewItem } from '@/src/lib/queue/view'
+import type { CardTime, ViewItem } from '@/src/lib/queue/view'
 
 /**
  * The grid, and the drag state that belongs to it.
@@ -12,18 +12,24 @@ import type { ViewItem } from '@/src/lib/queue/view'
  */
 export function QueueGrid({
   items,
-  slotLabels,
+  times,
+  timezone,
+  takenKeysFor,
   selected,
   onSelect,
   onCaptionSaved,
+  onScheduled,
   onAdvance,
   onReorder,
 }: {
   items: ViewItem[]
-  slotLabels: Map<string, string>
+  times: Map<string, CardTime>
+  timezone: string
+  takenKeysFor: (id: string) => Set<string>
   selected: Set<string>
   onSelect: (id: string, on: boolean) => void
   onCaptionSaved: (id: string, caption: string) => void
+  onScheduled: (id: string, scheduledAt: string | null) => void
   onAdvance: (id: string) => void
   onReorder: (dragId: string, overId: string) => void
 }) {
@@ -40,12 +46,15 @@ export function QueueGrid({
         <Card
           key={item.id}
           item={item}
-          slotLabel={slotLabels.get(item.id) ?? null}
+          time={times.get(item.id) ?? null}
+          timezone={timezone}
+          takenKeysFor={takenKeysFor}
           selected={selected.has(item.id)}
           dragging={dragId === item.id}
           dropTarget={overId === item.id && dragId !== null && dragId !== item.id}
           onSelect={onSelect}
           onCaptionSaved={onCaptionSaved}
+          onScheduled={onScheduled}
           onAdvance={onAdvance}
           onDragStart={setDragId}
           onDragOver={setOverId}

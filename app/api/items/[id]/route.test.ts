@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const setCaption = vi.hoisted(() => vi.fn())
 const setKind = vi.hoisted(() => vi.fn())
+const setScheduledAt = vi.hoisted(() => vi.fn())
 const deleteItem = vi.hoisted(() => vi.fn())
 
 // Only the three mutations are faked; QueueError, isItemKind and
@@ -11,6 +12,7 @@ vi.mock('@/src/lib/queue/repo', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/src/lib/queue/repo')>()),
   setCaption,
   setKind,
+  setScheduledAt,
   deleteItem,
 }))
 
@@ -32,6 +34,7 @@ let errs: ReturnType<typeof vi.spyOn>
 beforeEach(() => {
   setCaption.mockReset().mockResolvedValue(undefined)
   setKind.mockReset().mockResolvedValue(undefined)
+  setScheduledAt.mockReset().mockResolvedValue(undefined)
   deleteItem.mockReset().mockResolvedValue(undefined)
   errs = vi.spyOn(console, 'error').mockImplementation(() => {})
 })
@@ -155,5 +158,72 @@ describe('DELETE /api/items/[id]', () => {
     expect(res.status).toBe(500)
     expect((await res.json()).error).not.toContain('vercel_blob_rw')
     expect(errs).toHaveBeenCalled()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 14: the owner's own time for one post.
+// ---------------------------------------------------------------------------
+
+describe('PATCH /api/items/[id] — scheduledAt', () => {
+  it('saves the instant the body names', async () => {
+    const res = await PATCH(patchReq({ scheduledAt: '2026-08-09T11:35:00.000Z' }), params('abc'))
+    expect(res.status).toBe(200)
+    expect(setScheduledAt).toHaveBeenCalledWith('abc', new Date('2026-08-09T11:35:00.000Z'))
+  })
+
+  it('clears the time with an explicit null', async () => {
+    // null is the whole point of the field: it puts the item back in the slot
+    // queue. `undefined` means "not part of this request" and must not clear it.
+    const res = await PATCH(patchReq({ scheduledAt: null }), params('abc'))
+    expect(res.status).toBe(200)
+    expect(setScheduledAt).toHaveBeenCalledWith('abc', null)
+  })
+
+  it('does not touch the time when the field is absent', async () => {
+    await PATCH(patchReq({ caption: 'merhaba' }), params('abc'))
+    expect(setScheduledAt).not.toHaveBeenCalled()
+  })
+
+  it('counts as a field to update on its own', async () => {
+    const res = await PATCH(patchReq({ scheduledAt: null }), params('abc'))
+    expect(res.status).toBe(200)
+  })
+
+  it.each([
+    ['a number', 1_775_000_000_000],
+    ['a date that is not one', 'yarın öğlen'],
+    ['an empty string', ''],
+    ['an object', { at: '2026-08-09T11:35:00.000Z' }],
+    ['an impossible instant', '2026-13-40T25:99:00.000Z'],
+  ])('refuses %s without calling the repo', async (_label, value) => {
+    const res = await PATCH(patchReq({ scheduledAt: value }), params('abc'))
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'geçersiz tarih veya saat' })
+    expect(setScheduledAt).not.toHaveBeenCalled()
+  })
+
+  it('passes the repo\'s own refusal back to the owner', async () => {
+    // "bu dakika dolu" is written for a human and is the one thing that says
+    // what to do next; the generic 500 sentence would hide it.
+    setScheduledAt.mockRejectedValue(new QueueError('bu dakika dolu — başka bir saat seçin'))
+    const res = await PATCH(patchReq({ scheduledAt: '2026-08-09T11:35:00.000Z' }), params('abc'))
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error: 'bu dakika dolu — başka bir saat seçin' })
+  })
+
+  it('never echoes a driver failure', async () => {
+    setScheduledAt.mockRejectedValue(new Error('getaddrinfo ENOTFOUND ep-x.eu-central-1.aws.neon.tech'))
+    const res = await PATCH(patchReq({ scheduledAt: '2026-08-09T11:35:00.000Z' }), params('abc'))
+    expect(res.status).toBe(500)
+    expect(JSON.stringify(await res.json())).not.toContain('neon.tech')
+  })
+
+  it('applies the time before the caption, so a refusal leaves nothing applied', async () => {
+    const order: string[] = []
+    setScheduledAt.mockImplementation(async () => { order.push('scheduledAt') })
+    setCaption.mockImplementation(async () => { order.push('caption') })
+    await PATCH(patchReq({ caption: 'merhaba', scheduledAt: null }), params('abc'))
+    expect(order).toEqual(['scheduledAt', 'caption'])
   })
 })

@@ -1,7 +1,8 @@
 'use client'
 
 import { CaptionField } from './CaptionField'
-import { needsCaption, isUnrecorded, type ViewItem } from '@/src/lib/queue/view'
+import { ScheduleField } from './ScheduleField'
+import { needsCaption, isUnrecorded, type CardTime, type ViewItem } from '@/src/lib/queue/view'
 
 /**
  * A private drag type, so a card drag and a file drop can never be mistaken for
@@ -12,12 +13,15 @@ export const CARD_MIME = 'application/x-p2i-item'
 
 export function Card({
   item,
-  slotLabel,
+  time,
+  timezone,
+  takenKeysFor,
   selected,
   dragging,
   dropTarget,
   onSelect,
   onCaptionSaved,
+  onScheduled,
   onAdvance,
   onDragStart,
   onDragOver,
@@ -25,13 +29,17 @@ export function Card({
   onDrop,
 }: {
   item: ViewItem
-  /** When this item goes out, or null for one no slot will ever be spent on. */
-  slotLabel: string | null
+  /** When this item goes out, or null for one no publish will ever reach. */
+  time: CardTime | null
+  /** The zone the schedule runs in, for the date-and-time control. */
+  timezone: string
+  takenKeysFor: (id: string) => Set<string>
   selected: boolean
   dragging: boolean
   dropTarget: boolean
   onSelect: (id: string, on: boolean) => void
   onCaptionSaved: (id: string, caption: string) => void
+  onScheduled: (id: string, scheduledAt: string | null) => void
   onAdvance: (id: string) => void
   onDragStart: (id: string) => void
   onDragOver: (id: string) => void
@@ -111,8 +119,22 @@ export function Card({
         onAdvance={onAdvance}
       />
 
+      <ScheduleField
+        itemId={item.id}
+        value={item.scheduledAt}
+        timezone={timezone}
+        takenKeysFor={takenKeysFor}
+        onSaved={onScheduled}
+      />
+
       <div className="flex items-center justify-between gap-2 px-2 py-1.5 text-[11px] text-neutral-500">
-        <span className="truncate">{slotLabel ?? '—'}</span>
+        {/* Says WHICH kind of time this is — one the owner chose, or the slot
+            the queue computed — and turns red for a time that will produce no
+            post at all: one that has gone by, or one whose caption the
+            publisher refuses. */}
+        <span className={`truncate ${time?.warn ? 'text-red-600' : ''}`} title={time?.text ?? ''}>
+          {time?.text ?? '—'}
+        </span>
         <span className="shrink-0">
           {stuck ? (
             <span className="text-red-600" title="Instagram'a gitti ama kaydedilemedi">

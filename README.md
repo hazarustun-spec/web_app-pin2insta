@@ -149,6 +149,12 @@ npm run db:push
 
 The app does not need a `settings` row — every field falls back to its default.
 
+`items.scheduled_at` (the per-post time) is the most recent addition. It is
+nullable and every existing row keeps `NULL`, which means "use the next free
+slot" — exactly what those rows did before it existed. Run `npm run db:push`
+once BEFORE deploying the code that reads it; a deploy without it fails every
+query that names the column, including the cron publisher's.
+
 ## Connecting the Instagram account
 
 The Graph API will not publish to a personal account. In order:
@@ -176,6 +182,13 @@ queue page says so, loudly. Stories are exempt — they publish without a captio
 
 **A missed slot is not made up.** Posting twice in an hour to catch up reads as
 spam, so a skipped slot is simply lost.
+
+**A post can carry its own date and time.** Set one on the card and it goes out
+at that minute instead of in the next free slot — it is not counted against the
+day's slots either, so five posts scheduled for tomorrow are five posts. Leave
+it empty and nothing changes. Two posts cannot share a minute (the card refuses
+the second), and a chosen time that goes by is missed for good, exactly like a
+slot: the queue page names it and offers a new time or the slot queue back.
 
 **Duplicates are refused.** Every image is hashed after cropping, so the same
 picture cannot be queued twice, whether dropped again or pasted from a link.
